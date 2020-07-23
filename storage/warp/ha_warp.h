@@ -76,6 +76,8 @@
 
 #include "sparse.hpp"
 
+#include "sql/sql_thd_internal_api.h"
+
 /*
   Version for file format.
   1 - Initial Version. That is, the version when the metafile was introduced.
@@ -140,13 +142,58 @@ struct WARP_SHARE {
   std::string table_name;
   uint table_name_length, use_count;
   char data_dir_name[FN_REFLEN];
+  char mysql_data_dir[FN_REFLEN];
   uint64_t next_rowid = 0;  
   mysql_mutex_t mutex;
   THR_LOCK lock;
 };
 
+std::mutex warp_global_mtx;
+class warp_global_data {
+  public:
+  ulonglong next_trx_id = 0;
+};
+warp_global_data warp_state;
+
+  /* These structures are used for writing to the commit
+     log.
+  */
+  struct commit_log_record {
+    uint64_t trx_id;
+    uint8_t  flag; // 0 - uncommitted, 1 = committed, 2=add table to trx
+    char* data;
+    uint32_t data_len;
+  };
+
+  /* This record is written to the trx log at successful shutdown.  It
+     means the server can truncate the log at startup and not worry
+     about rolling back uncomitted transactions or checking tables
+     for half written records.
+  */
+  struct shutdown_ok_record: commit_log_record {
+    uint64_t trx_id   = 0;
+    uint8_t flag      = 0;
+    char* data        = NULL;
+    uint32_t data_len = 0;
+  };
+
+  struct shutdown_ok_record SHUTDOWN_OK;
+
 static WARP_SHARE *get_share(const char *table_name, TABLE* table_ptr);
 static int free_share(WARP_SHARE *share); 
+
+int warp_commit(handlerton*, THD *, bool);                             
+int warp_rollback(handlerton *, THD *, bool);
+
+
+class warp_trx {
+  public:
+  ulonglong trx_id = 0;
+  uint64_t lock_count = 0;
+  uint64_t writer_count = 0;
+  enum enum_tx_isolation isolation_level;
+  int begin();
+};
 
 class ha_warp : public handler {
   /* MySQL lock - Fastbit has its own internal mutex implementation.  This is used to protect the share.*/
@@ -155,6 +202,8 @@ class ha_warp : public handler {
   /* Shared lock info */
   WARP_SHARE *share;  
   
+
+
   
  private:
   void update_row_count();
@@ -173,15 +222,33 @@ class ha_warp : public handler {
   void close_deleted_bitmap();
   bool is_deleted(uint64_t rowid);
   void write_dirty_rows();
-  
+  void open_commit_bitmap(int lock_mode);
+  void close_commit_bitmap();
+  int open_trx_log();
+  int close_trx_log();
+
+  int external_lock(THD *thd, int lock_type);
+  int start_stmt(THD *thd, thr_lock_type lock_type);
+  int end_stmt();
+  std::mutex thd_lock;
+
+
   /* These objects are used to access the FastBit tables for tuple reads.*/ 
   ibis::mensa*         base_table         = NULL; 
   ibis::table*         filtered_table     = NULL;
   ibis::table*         idx_filtered_table = NULL;
   ibis::table::cursor* cursor             = NULL;
   ibis::table::cursor* idx_cursor         = NULL;
-  sparsebitmap*        deleted_bitmap     = NULL;       
-  
+
+  /* These objects are used by WARP to add functionality to Fastbit
+     such as deletion/update of rows and transactions
+  */
+  sparsebitmap*        deleted_bitmap     = NULL;  
+  sparsebitmap*        commit_bitmap      = NULL;    
+  FILE*                commit_log         = NULL; 
+
+
+
   /* WHERE clause constructed from engine condition pushdown */
   std::string          push_where_clause  = "";
 
@@ -209,7 +276,7 @@ class ha_warp : public handler {
 
  public:
   ha_warp(handlerton *hton, TABLE_SHARE *table_arg);
- 
+  handlerton* warp_hton;
   ~ha_warp() {
     //free_root(&blobroot, MYF(0));
   }
@@ -218,7 +285,7 @@ class ha_warp : public handler {
  
   ulonglong table_flags() const {
     // return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE | HA_CAN_REPAIR);
-    return (HA_NO_TRANSACTIONS | HA_BINLOG_ROW_CAPABLE | HA_CAN_REPAIR);
+    return (HA_BINLOG_ROW_CAPABLE | HA_CAN_REPAIR);
   }
  
   uint max_record_length() const { return HA_MAX_REC_LENGTH; }
@@ -270,6 +337,8 @@ class ha_warp : public handler {
              dd::Table *table_def);
   bool check_if_incompatible_data(HA_CREATE_INFO *info, uint table_changes);
   int delete_table(const char *table_name, const dd::Table *);
+  int get_trx(THD* thd, warp_trx* &trx);
+  int register_trx_with_mysql(THD* thd, warp_trx* trx);
   //int truncate(dd::Table *);
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);

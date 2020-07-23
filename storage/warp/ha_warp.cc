@@ -124,6 +124,8 @@ static int warp_init_func(void *p) {
   warp_hton->flags = (HTON_CAN_RECREATE | HTON_NO_PARTITION);
   warp_hton->file_extensions = ha_warp_exts;
   warp_hton->rm_tmp_tables = default_rm_tmp_tables;
+  warp_hton->commit = warp_commit;
+  warp_hton->rollback = warp_rollback;
 
   DBUG_RETURN(0);
 }
@@ -138,13 +140,42 @@ static int warp_done_func(void *) {
 /* Construct the warp handler */
 ha_warp::ha_warp(handlerton *hton, TABLE_SHARE *table_arg)
     : handler(hton, table_arg),
-      // reader(NULL),
       base_table(NULL),
       filtered_table(NULL),
       cursor(NULL),
       writer(NULL),
       current_rowid(0),
-      blobroot(warp_key_memory_blobroot, BLOB_MEMROOT_ALLOC_SIZE) {}
+      blobroot(warp_key_memory_blobroot, BLOB_MEMROOT_ALLOC_SIZE) {
+        warp_hton = hton;
+      }
+
+/* Open the transaction log
+   returns 0 if there are no transactions to be examined in the log
+   otherwise returns the size of the log
+*/
+int ha_warp::open_trx_log() {
+  std::string trx_log_file =
+      std::string(share->mysql_data_dir) + "/trxlog.warp";
+  struct stat st;
+  stat(trx_log_file.c_str(), &st);
+  commit_log = fopen(trx_log_file.c_str(), "rb+");
+  if(commit_log != NULL) {
+    fprintf(stderr, "WARP FATAL ERROR: Unable to open %s for writing", trx_log_file.c_str());
+    assert(commit_log != NULL);
+  }
+  fseek(commit_log, 0, SEEK_END);
+  return(ftell(commit_log));
+}
+
+/* Close the transaction log.
+   Returns 0 on success 
+*/
+int ha_warp::close_trx_log() {
+  fflush(commit_log);
+  int retval = fclose(commit_log);
+  if(!retval) commit_log = NULL;
+  return retval;
+}
 
 void ha_warp::open_deleted_bitmap(int lock_mode) {
   struct stat st;
@@ -170,6 +201,26 @@ void ha_warp::close_deleted_bitmap() {
   deleted_bitmap->close();
   delete deleted_bitmap;
   deleted_bitmap = NULL;
+}
+
+void ha_warp::open_commit_bitmap(int lock_mode) {
+  struct stat st;
+  if(commit_bitmap != NULL) {
+    return;
+  }
+  std::string committed_trx_file =
+      std::string(share->mysql_data_dir) + "/commits.warp";
+  stat(committed_trx_file.c_str(), &st);
+
+  commit_bitmap = new sparsebitmap(committed_trx_file, lock_mode, 0);
+}
+
+void ha_warp::close_commit_bitmap() {
+  if(commit_bitmap == NULL) return;
+  commit_bitmap->commit();
+  commit_bitmap->close();
+  delete commit_bitmap;
+  commit_bitmap = NULL;
 }
 
 bool ha_warp::is_deleted(uint64_t rownum) {
@@ -324,8 +375,31 @@ static WARP_SHARE *get_share(const char *table_name, TABLE *) {
 
     share->use_count = 0;
     share->table_name.assign(table_name, length);
+    /* This is where the WARP data is actually stored.  It is usually 
+       something like /var/lib/mysql/dbname/tablename.data
+    */
     fn_format(share->data_dir_name, table_name, "", ".data",
               MY_REPLACE_EXT | MY_UNPACK_FILENAME);
+
+    /* This is the MySQL data directory, or alternatively in
+       the future WARP_DATA_DIR storage engine variable.
+       TODO: add WARP_DATA_DIR storage engine variable.
+
+       if the table data directory is /var/lib/mysql/db/table.data
+       the MySQL data directory is /var/lib/mysql.  The
+       fn_format command will make the string "/var/lib/mysql/db"
+       this code looks backwards for the first / and writes 
+       NULL into the /db part to result in "/var/lib/mysql/"
+    */
+    fn_format(share->mysql_data_dir, "", "", "",
+              MY_REPLACE_EXT | MY_UNPACK_FILENAME);
+    int dirname_len = strlen(share->mysql_data_dir);
+    int i = dirname_len;
+    for(; i>=0; --i) {
+      if(share->mysql_data_dir[i] == '/') break;
+    }
+    memset(share->mysql_data_dir + i + 1, 0, dirname_len - i);
+    fprintf(stderr, "MySQL data dir is located at: %s\n", share->mysql_data_dir);
 
     warp_open_tables->emplace(table_name, share);
     thr_lock_init(&share->lock);
@@ -2267,4 +2341,110 @@ bool ha_warp::append_column_filter(const Item *cond,
   }
 
   return true;
+}
+
+int warp_trx::begin() {
+  if(trx_id == 0) {
+    fprintf(stderr, "WARP_TRX: start new transaction\n");
+    warp_global_mtx.lock();
+    trx_id = warp_state.next_trx_id++;
+    warp_global_mtx.unlock();
+    fprintf(stderr, "WARP_TRX: trx_id: %s\n", std::to_string(trx_id).c_str());
+    return 0;
+  } 
+  fprintf(stderr, "WARP_TRX: use existing transaction: %s\n", std::to_string(trx_id).c_str());
+  return 1;
+}
+
+int ha_warp::start_stmt(THD *thd, thr_lock_type lock_type) {
+  fprintf(stderr, "ENTER START_STMT\n");
+  int trx_state = 0;
+  int retval = 0;
+  uint slot = warp_hton->slot;
+  Ha_data* ha_data = thd->get_ha_data(slot);
+  
+  warp_trx *trx= (warp_trx*)ha_data->ha_ptr;
+  
+  if (trx == NULL) { 
+    fprintf(stderr, "WARP: create new trx\n");
+    trx = new warp_trx;
+    ha_data->ha_ptr = (void*)trx;
+  }
+  
+  trx_state = trx->begin();
+  if(trx_state == 0) {
+    trans_register_ha(thd, true, warp_hton, const_cast<ulonglong*>(&(trx->trx_id)));
+    fprintf(stderr, "WARP START_STMT: created trx!\n");
+  } else if(trx_state == 1) {
+    //txn->stmt= txn->new_savepoint();
+    trans_register_ha(thd, false, warp_hton, const_cast<ulonglong*>(&(trx->trx_id)));
+    fprintf(stderr, "WARP START_STMT: continue trx!\n");
+  } else {
+    retval = -1;
+  }
+  return retval;
+}
+
+int ha_warp::end_stmt() {
+  fprintf(stderr, "END STATEMENT\n");
+  return 0;
+}
+
+int ha_warp::get_trx(THD* thd, warp_trx* &trx) {
+  trx = (warp_trx*)thd->get_ha_data(warp_hton->slot)->ha_ptr;
+  if(trx == NULL) { 
+    trx = new warp_trx;
+    trx->isolation_level = thd_get_trx_isolation(thd);
+    thd->get_ha_data(warp_hton->slot)->ha_ptr = (void*)trx;
+
+  } 
+  return trx->begin();
+}
+
+int ha_warp::register_trx_with_mysql(THD* thd, warp_trx* trx) {
+  long long all_trx = thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK);
+  trans_register_ha(thd, all_trx > 0, warp_hton, const_cast<ulonglong*>(&(trx->trx_id)));
+  return 0;
+}
+
+int ha_warp::external_lock(THD *thd, int lock_type){ 
+  DBUG_TRACE;
+  DBUG_PRINT("enter", ("lock_type: %d", lock_type));
+  int trx_state = 0;
+  int retval = 0;
+  
+  warp_trx* trx;
+  trx_state = get_trx(thd, trx);
+
+  if (lock_type != F_UNLCK)  {
+    trx->lock_count++;
+
+    if(trx_state >= 0) {
+      register_trx_with_mysql(thd, trx);
+    } else {
+      /* FAILED TO START TRX */
+      retval = -1;
+    }
+  } else {
+      trx->lock_count--;
+      if(trx->lock_count == 0) {
+        /*if(!thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK)) {
+          warp_commit(warp_hton, thd, true);
+        } */
+      }
+  }
+
+  return retval;
+}
+
+int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
+  fprintf(stderr, "WARP_COMMIT: all=%d\n", (int)commit_trx);
+  //ha_commit_trans(thd, all);
+  return 0;
+}
+
+int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
+  fprintf(stderr, "WARP_ROLLBACK: all=%d\n", (int)rollback_trx);
+  //ha_rollback_trans(thd, all);
+  return 0;
 }
