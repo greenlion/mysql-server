@@ -57,6 +57,8 @@
 #include "sql/table.h"
 #include "template_utils.h"
 
+#include "sql/log.h"
+
 
 #include <fstream>  
 #include <iostream>  
@@ -64,6 +66,7 @@
 #include <atomic>
 #include <vector>
 #include <thread>
+#include <forward_list>
 
 #include "include/fastbit/ibis.h"
 #include "include/fastbit/query.h"
@@ -82,12 +85,14 @@
   Version for file format.
   1 - Initial Version. That is, the version when the metafile was introduced.
 */
+const uint16_t WARP_VERSION = 2;
 
-#define WARP_VERSION 1
-/* 1 million rows per partition is small, but I want to stress test the 
-   database with lots of partitions to start
-*/
 #define BLOB_MEMROOT_ALLOC_SIZE 8192
+
+static const char *ha_warp_exts[] = {
+  ".data",
+  NullS
+};
 
 /* engine variables */
 static unsigned long long my_partition_max_rows, my_cache_size, my_write_cache_size;
@@ -142,69 +147,202 @@ struct WARP_SHARE {
   std::string table_name;
   uint table_name_length, use_count;
   char data_dir_name[FN_REFLEN];
-  char mysql_data_dir[FN_REFLEN];
   uint64_t next_rowid = 0;  
   mysql_mutex_t mutex;
   THR_LOCK lock;
 };
 
-std::mutex warp_global_mtx;
+
+//std::mutex warp_state_io_mtx;
+
+// used to protect the global state data
+
+
 class warp_global_data {
+  private:
+  // held when reading or modifying state
+  std::mutex mtx;
+
+  std::string shutdown_clean_file = "shutdown_clean.warp";
+  std::string warp_state_file     = "state.warp";
+  std::string commit_bitmap_file  = "commits.warp";
+  uint64_t rowid_batch_size = 10000;
+
+  // each write to the state file increments the state counter
+  // the state file has two records.  the state record with
+  // the highest counter is used.
+  uint64_t state_counter = 1;
+  
+  // Each time a transaction is handed out, this is pre-incremented
+  // and the value is used for the tranaction identifier.  When the
+  // transaction is committed, this idenifier is written into the
+  // commit bitmap once all the background writers associated with
+  // the transaction complete writing.
+  ulonglong next_trx_id = 1;
+
+  // Each time a write into a table starts, WARP hands out 
+  // a set of 10000 rowid values, and this counter is 
+  // incremented by 10000.  If a transaction runs out of
+  // rowid values, it can request another batch of 10000
+  // more.  Since rowid values are 64 bit, handing out 
+  // in 10000 row batches is fine.  This value is persisted
+  // between database restarts.
+  uint64_t next_rowid = 1;
+
+  // in order to detect unique keys during insertions or updates
+  // it is necessary to distinguish between a transaction that
+  // was rolled back and thus is missing from the commit bitmap
+  // because of rollback or crash, or a transaction that is 
+  // currently open for write.  In the first case, the unique
+  // check must ignore the row, but in the second case the 
+  // unique check must fail, otherwise duplicate values could
+  // end up in a column with a unique or primary key
+  std::forward_list<uint64_t> open_write_trx;
+
+  /* this is used to read/write on disk state */
+  struct on_disk_state {
+    public:
+    uint64_t version;
+    uint64_t next_trx_id;
+    uint64_t next_rowid;
+    uint64_t state_counter;
+  };
+
+  // handle to the warp state
+  FILE* fp = NULL;
+
+  // write the current state to the state file
+  void write();
+
+  // checks the state of the on-disk state
+  bool check_state();
+
+  // reads the state from disk
+  uint64_t get_state_and_return_version();
+
+  // return false if shutdown file was not found
+  bool was_shutdown_clean();
+
+  // used to repair tables
+  bool repair_tables();
+
+  void write_clean_shutdown();
+
   public:
-  ulonglong next_trx_id = 0;
+  // bitmap into which committed transactions are persisted
+  // sparse bitmaps have write-ahead logging so a crash 
+  // during commit will result in the transaction never
+  // becoming visible
+  // note because the sparse bitmap implements locking
+  // the mutex does not need to be held to modify 
+  // the commit bitmap
+  sparsebitmap* commit_bitmap = NULL;
+ 
+  // opens and reads the state file.  
+  // if the on-disk version of data is older than the current verion
+  // the database will be upgraded.  If the on disk version is newer
+  // than the current version, this will assert and the database will
+  // fail to start and MySQL will be crashed on purpose!
+  // if shutdown was not clean, then table repair will be executed.
+  warp_global_data();
+
+  // called at database shutdown.  
+  // Calls write() to persist the state to disk
+  // writes the clean shutdown file
+  ~warp_global_data();
+  
+  uint64_t get_next_rowid_batch();
+  uint64_t get_next_trx_id();
+  bool is_transaction_open(uint64_t check_trx_id);
+  void mark_transaction_closed(uint64_t trx_id);
+  void register_open_trx(uint64_t trx);
+
 };
-warp_global_data warp_state;
 
-  /* These structures are used for writing to the commit
-     log.
-  */
-  struct commit_log_record {
-    uint64_t trx_id;
-    uint8_t  flag; // 0 - uncommitted, 1 = committed, 2=add table to trx
-    char* data;
-    uint32_t data_len;
-  };
+//Initialized in the SE init function, destroyed when engine is removed
+warp_global_data* warp_state;
 
-  /* This record is written to the trx log at successful shutdown.  It
-     means the server can truncate the log at startup and not worry
-     about rolling back uncomitted transactions or checking tables
-     for half written records.
-  */
-  struct shutdown_ok_record: commit_log_record {
-    uint64_t trx_id   = 0;
-    uint8_t flag      = 0;
-    char* data        = NULL;
-    uint32_t data_len = 0;
-  };
-
-  struct shutdown_ok_record SHUTDOWN_OK;
-
+//The MySQL table share functions
 static WARP_SHARE *get_share(const char *table_name, TABLE* table_ptr);
 static int free_share(WARP_SHARE *share); 
 
-int warp_commit(handlerton*, THD *, bool);                             
+//Called when a transaction or statement commits.  A pointer to this
+//function is registered on the hanlderton
+int warp_commit(handlerton*, THD *, bool);
+
+//Called when a transaction or statement rolls back
+// A pointer to this function is registered on the hanlderton                       
 int warp_rollback(handlerton *, THD *, bool);
 
+//Called by the warp_state constructor to upgrade on disk tables when
+//the on-disk version is older than the current version
+int warp_upgrade_tables(uint16_t version);
 
+//Holds the state of a WARP transaction.  Instantiated in ::external_lock
+//or ::start_stmt
 class warp_trx {
   public:
+  //the transaction identifier 
   ulonglong trx_id = 0;
+
+  //number of table locks (read or write) held by the transaction
   uint64_t lock_count = 0;
-  uint64_t writer_count = 0;
+
+  //number of background writers that are doing work.  The commit
+  //function must wait for this counter to reach zero before a 
+  //transaction can be committed
+  uint64_t background_writer_count = 0;
+
+  THD* thd = NULL;
+  handlerton* hton; 
+
+  //the transaction was not a read-only transaction and it 
+  //modified rows in the database, so it must be writen into
+  //the commit bitmap when it commmits
+  bool dirty = false;
+
+  //autocommit statements commit each time the commit function
+  //is called
+  bool autocommit = false;
+
+  //selected transaction isolation level.  Only SERIALIZABLE,
+  //REPEATABLE-READ and READ-COMMITTED are actually supported
   enum enum_tx_isolation isolation_level;
+  std::unordered_set<std::string> tables; 
+
+  //called when transactions start
   int begin();
+  
+  //called when transcations end
+  void commit();
+
+  //never actually called but here for completeness if 
+  //needed in the future
+  void rollback();
 };
 
+// determines is a transaction_id is an open transaction
+// used for UNIQUE check visibility during inserts
+// and for REPEATABLE READ during scans
+bool warp_is_trx_open(uint64_t trx_id);
+
+//warp_trx* warp_get_trx(handlerton* hton, THD* thd);
+
+//This is the handler where the majority of the work is done.  Handles
+//creating and dropping tables, TRUNCATE table, reading from indexes,
+//scanning tables, inserts, updates, deletes, engine condition pushdown
 class ha_warp : public handler {
   /* MySQL lock - Fastbit has its own internal mutex implementation.  This is used to protect the share.*/
   THR_LOCK_DATA lock; 
 
   /* Shared lock info */
   WARP_SHARE *share;  
-  
 
+ /* used in visibility checks */
+ uint64_t last_trx_id = 0;
+ bool is_visible = false;
+ warp_trx* current_trx = NULL;
 
-  
  private:
   void update_row_count();
   int reset_table();
@@ -221,17 +359,12 @@ class ha_warp : public handler {
   void open_deleted_bitmap(int lock_mode = LOCK_SH);
   void close_deleted_bitmap();
   bool is_deleted(uint64_t rowid);
-  void write_dirty_rows();
-  void open_commit_bitmap(int lock_mode);
-  void close_commit_bitmap();
+  //void write_dirty_rows();
   int open_trx_log();
   int close_trx_log();
-
-  int external_lock(THD *thd, int lock_type);
-  int start_stmt(THD *thd, thr_lock_type lock_type);
-  int end_stmt();
-  std::mutex thd_lock;
-
+  std::string make_unique_check_clause();
+  
+  //std::mutex thd_lock;
 
   /* These objects are used to access the FastBit tables for tuple reads.*/ 
   ibis::mensa*         base_table         = NULL; 
@@ -245,9 +378,7 @@ class ha_warp : public handler {
   */
   sparsebitmap*        deleted_bitmap     = NULL;  
   sparsebitmap*        commit_bitmap      = NULL;    
-  FILE*                commit_log         = NULL; 
-
-
+  //FILE*                commit_log         = NULL; 
 
   /* WHERE clause constructed from engine condition pushdown */
   std::string          push_where_clause  = "";
@@ -315,7 +446,8 @@ class ha_warp : public handler {
            const dd::Table *table_def);
   int close(void);
 
-  std::string make_unique_check_clause();
+  
+  const char **bas_ext() const ;
   int write_row(uchar *buf);
   int update_row(const uchar *old_data, uchar *new_data);
   int delete_row(const uchar *buf);
@@ -337,8 +469,12 @@ class ha_warp : public handler {
              dd::Table *table_def);
   bool check_if_incompatible_data(HA_CREATE_INFO *info, uint table_changes);
   int delete_table(const char *table_name, const dd::Table *);
-  int get_trx(THD* thd, warp_trx* &trx);
+  int get_or_create_trx(THD* thd, warp_trx* &trx);
+  int external_lock(THD *thd, int lock_type);
+  int start_stmt(THD *thd, thr_lock_type lock_type);
   int register_trx_with_mysql(THD* thd, warp_trx* trx);
+  bool is_visible_to_read(uint64_t row_trx_id);
+  
   //int truncate(dd::Table *);
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);
@@ -369,17 +505,11 @@ class ha_warp : public handler {
     ulonglong * 	nb_reserved_values 
   );
 
+  // Functions to support engine condition pushdown (ECP)
   int engine_push(AQP::Table_access *table_aqp);
   const Item* cond_push(const Item *cond,	bool other_tbls_ok );
 	
-  int rename_table(const char * from, const char * to, const dd::Table* , dd::Table* ) {
-    DBUG_ENTER("ha_example::rename_table ");
-    std::string cmd = "mv " + std::string(from) + ".data/ " + std::string(to) + ".data/";
-    
-    system(cmd.c_str()); 
-    DBUG_RETURN(0);
-  }
-
+  int rename_table(const char * from, const char * to, const dd::Table* , dd::Table* );
   
 };
 #endif
