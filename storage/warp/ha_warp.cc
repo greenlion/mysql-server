@@ -165,45 +165,8 @@ int ha_warp::rename_table(const char * from, const char * to, const dd::Table* ,
   DBUG_RETURN(0);
 }
 
-void ha_warp::open_deleted_bitmap(int lock_mode) {
-  struct stat st;
-  if(deleted_bitmap != NULL) {
-    return;
-  }
-  std::string deleted_rid_file =
-      std::string(share->data_dir_name) + "/deleted.rids";
-  stat(deleted_rid_file.c_str(), &st);
-  if(!st.st_size) {
-    has_deleted_rows = false;
-  } else {
-    has_deleted_rows = true;
-  }
-  try {
-    deleted_bitmap = new sparsebitmap(deleted_rid_file, lock_mode);
-  } catch(...) {
-    sql_print_error("Could not open deleted bitmap %s", deleted_rid_file.c_str());
-    assert(false);
-  }
-}
-
-void ha_warp::close_deleted_bitmap() {
-  if(deleted_bitmap == NULL) return;
-  if(deleted_bitmap->commit() != 0) {
-    sql_print_error("Could not commit deleted bitmap %s", deleted_bitmap->get_fname().c_str());
-    assert(false);
-  }
-  if(deleted_bitmap->close() != 0) {
-    sql_print_error("Could not close deleted bitmap %s", deleted_bitmap->get_fname().c_str());
-    assert(false);
-  }
-  delete deleted_bitmap;
-  deleted_bitmap = NULL;
-}
-
 bool ha_warp::is_deleted(uint64_t rownum) {
-  open_deleted_bitmap(LOCK_SH);
-  if(!has_deleted_rows) return false;
-  return deleted_bitmap->is_set(rownum);
+  return warp_state->delete_bitmap->is_set(rownum);
 }
 
 void ha_warp::get_auto_increment(ulonglong, ulonglong, ulonglong,
@@ -935,12 +898,18 @@ int ha_warp::write_row(uchar *buf) {
   DBUG_ENTER("ha_warp::write_row");
   ha_statistic_increment(&System_status_var::ha_write_count);
   mysql_mutex_lock(&share->mutex);
+  std::string insert_log_filename = "";
   if(share->next_rowid == 0) {
     share->next_rowid = warp_state->get_next_rowid_batch();
   } else {
     current_rowid = share->next_rowid--;
   }
   mysql_mutex_unlock(&share->mutex);
+  get_or_create_trx(current_thd, current_trx);
+  assert(current_trx != NULL);
+  
+  current_trx->open_insert_log();
+
   /* check for duplicate key values */
   int errcode = 0;
   current_trx = NULL;
@@ -960,8 +929,6 @@ int ha_warp::write_row(uchar *buf) {
           tbl->select("r,t", unique_check_where_clause.c_str());
       
       if(rows) {
-        get_or_create_trx(current_thd, current_trx);
-        assert(current_trx != NULL);
         
         auto csr = rows->createCursor();
         uint64_t rowid=0;
@@ -971,7 +938,7 @@ int ha_warp::write_row(uchar *buf) {
         // again
         last_trx_id = 0;
         is_visible = false;
-        open_deleted_bitmap();
+        
         
         if(csr) {
           for(uint64_t i=0;errcode == 0 && i<rows->nRows();++i) {
@@ -1022,19 +989,17 @@ int ha_warp::write_row(uchar *buf) {
               break;
             }
 
-            if(!deleted_bitmap->is_set(rowid)) {
+            if(!warp_state->delete_bitmap->is_set(rowid)) {
                 errcode = HA_ERR_FOUND_DUPP_KEY;
             }  
           }
           delete csr;
         }
-        close_deleted_bitmap();
         delete rows;
       } 
       delete tbl;
     }
-    if(errcode != 0) DBUG_RETURN(errcode);
-    
+     DBUG_RETURN(errcode);   
   }
   /* This will return a cached writer unless a background
     write was started on the last insert.  In that case
@@ -1096,13 +1061,10 @@ int ha_warp::write_row(uchar *buf) {
 
 int ha_warp::update_row(const uchar *, uchar *new_data) {
   DBUG_ENTER("ha_warp::update_row");
-  // write_row may trigger a unique key error in which case
-  // the deleted bitmap is not set
-  has_deleted_rows = true;
   uint64_t deleted_rowid = current_rowid;
   auto retval = write_row(new_data);
   if(retval == 0) {
-    deleted_bitmap->set_bit(deleted_rowid);
+    warp_state->delete_bitmap->set_bit(deleted_rowid);
   }
   ha_statistic_increment(&System_status_var::ha_update_count);
   DBUG_RETURN(retval);
@@ -1119,9 +1081,7 @@ int ha_warp::update_row(const uchar *, uchar *new_data) {
 */
 int ha_warp::delete_row(const uchar *) {
   DBUG_ENTER("ha_warp::delete_row");
-  has_deleted_rows = true;
-  deleted_bitmap->set_bit(current_rowid);
-
+  warp_state->delete_bitmap->set_bit(current_rowid);
   ha_statistic_increment(&System_status_var::ha_delete_count);
   stats.records--;
   DBUG_RETURN(0);
@@ -1253,14 +1213,11 @@ void ha_warp::maintain_indexes(char *datadir, TABLE *table) {
    work.
 */
 int ha_warp::extra(enum ha_extra_function) {
-  close_deleted_bitmap();
-
   if(writer != NULL && writer->mRows() > 0) {
     /* foreground write actually... */
     background_write(writer, share->data_dir_name, table, share);
     writer = NULL;
   }
-
   return 0;
 }
 
@@ -1554,11 +1511,6 @@ int ha_warp::rnd_init(bool) {
   last_trx_id = 0;
   current_trx = NULL;
 
-  /* This is a sparse (un)compressed (not WAH compressed) bitmap index
-     used for marking deleted rows.
-  */
-  open_deleted_bitmap();
-
   /* This is the a big part of the performance advantage of WARP outside of
      the bitmap indexes.  This figures out which columns this query is reading
      so we only read the necesssary columns from disk.
@@ -1699,7 +1651,6 @@ int ha_warp::rnd_end() {
   delete base_table;
   base_table = NULL;
   push_where_clause = "";
-  close_deleted_bitmap();
   DBUG_RETURN(0);
 }
 
@@ -1776,7 +1727,6 @@ int ha_warp::index_init(uint idxno) {
   if(column_set == "") {
     set_column_set();
   }
-  open_deleted_bitmap();
   return (0);
 }
 
@@ -1857,7 +1807,6 @@ int ha_warp::index_end() {
     base_table = NULL;
   }
   push_where_clause = "";
-  close_deleted_bitmap();
   DBUG_RETURN(0);
 }
 
@@ -2523,17 +2472,49 @@ int ha_warp::get_or_create_trx(THD* thd, warp_trx* &trx) {
     trx->autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK);
   }
   enum_sql_command sql_command = (enum_sql_command)thd_sql_command(thd);
-  if(!trx->dirty && 
-     (sql_command == SQLCOM_UPDATE || 
+  if(sql_command == SQLCOM_UPDATE || 
      sql_command == SQLCOM_INSERT ||
      sql_command == SQLCOM_REPLACE ||
-     sql_command == SQLCOM_DELETE))  
-  {
-     trx->dirty = true;
-     warp_state->register_open_trx(trx->trx_id);
+     sql_command == SQLCOM_DELETE)  
+  {  // the first time a data modification statement is encountered
+     // the transaction is marked dirty.  Registering the open
+     // transaction prevents a transaction from seeing inserts
+     // that are not visible to it and to still find duplicate
+     // keys in transactions doing concurrent inserts
+     if(!trx->dirty) {
+       warp_state->register_open_trx(trx->trx_id);
+       trx->dirty = true;
+     }
+     
+     // used to roll back the deletions in a single DELETE or
+     // UPDATE or REPLACE statement
+     if(sql_command == SQLCOM_UPDATE || 
+        sql_command == SQLCOM_REPLACE ||
+        sql_command == SQLCOM_DELETE) {
+       warp_state->delete_bitmap->create_savepoint();
+     }
   }
   
   return 0;
+}
+
+void warp_trx::open_insert_log() {
+  if(insert_log == NULL) {
+    insert_log_filename = std::to_string(trx_id) + std::string(".txlog");
+    insert_log=fopen(insert_log_filename.c_str(), "w");
+    if(insert_log == NULL) {
+      sql_print_error("Could not open insert_log %s", insert_log_filename.c_str());
+      assert(false);
+    }
+  }
+}
+
+void warp_trx::write_insert_log_rowid(uint64_t rowid) {
+  int sz = fwrite(&rowid, sizeof(uint64_t), 1, insert_log);
+  if(sz == 0 || ferror(insert_log) != 0) {
+    sql_print_error("failed to write rowid into insert log: %s", insert_log_filename.c_str());
+    assert(false);
+  }
 }
 
 int warp_trx::begin() {
@@ -2559,12 +2540,32 @@ void warp_trx::commit() {
       assert(false);
     }
   }
-  
+  if(insert_log != NULL) {
+    fclose(insert_log);
+    unlink(insert_log_filename.c_str());
+    insert_log = NULL;
+  }
   dirty=0;
 }
 
-void warp_trx::rollback() {
-  dirty=0;
+// used when an INSERT statement fails due to duplicate key error
+void warp_trx::rollback_inserts() {
+  if(insert_log != NULL) {
+    uint64_t rollback_insert_rowid = 0;
+    fseek(insert_log, 0, SEEK_SET);
+    clearerr(insert_log);
+    do {
+      rollback_insert_rowid = 0;
+      fread(&rollback_insert_rowid, sizeof(uint64_t), 1, insert_log);
+      if(rollback_insert_rowid > 0) {
+        warp_state->delete_bitmap->set_bit(rollback_insert_rowid);
+      } 
+    } while(!feof(insert_log));
+    warp_state->delete_bitmap->commit();
+    fclose(insert_log);
+    insert_log = NULL;
+    unlink(insert_log_filename.c_str());
+  }
 }
 
 
@@ -2587,27 +2588,19 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
   warp_trx* trx = warp_get_trx(hton, thd);
   dbug("TRANSACTIN_ID: " + std::to_string(trx->trx_id));
 
-  if(trx->autocommit || commit_trx) {
-    dbug("MMM");
-    if(trx->dirty) {
-      dbug("MMM2");
-       trx->commit();
-       warp_state->mark_transaction_closed(trx->trx_id);
-    }
-  } else {
-    dbug("PPP");
-    /* this transaction is not ready to be committed to the
-       storage engine because it is part of a multi-statement
-       transaction
-    */
+  if(!trx->autocommit && !commit_trx) {
     return 0;
+  }
+  if(trx->dirty) {
+    trx->commit();
+    warp_state->delete_bitmap->commit();
+    warp_state->mark_transaction_closed(trx->trx_id);
   }
     
   /* if the transaction (autocommit or multi-statement) was 
      commited to disk, then the transaction information for
      the connection must be destroyed.
   */
-  dbug("WOOF");
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
   delete trx;
   return 0;
@@ -2617,32 +2610,36 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
     -------------------------------------------------------------
     rollback_trx will be false if either the transaction is
     autocommit or if this is a single statement in a 
-    multi-statement transaction.  
-    
-    If this is a multi-statement transaction, the rollback function 
-    doesn't do anything. Statements that failed (and thus would 
-    need to be rolled back) never write any information to disk
-    so there is no need to do anything.  
-
-    Multi-statement transactions that roll back, and autocommit
-    transactions that roll back must destroy the transaction but
-    there is no more work to do. 
-    
-    In a multi-statement transaction, any ucommitted data written 
-    to disk will not have a bit persisted into the commit bitmap 
-    by warp_commit() and thus will not be visible to future 
-    transactions.  All that is needed in this case is to destroy the 
-    transaction information.
-  */
+    multi-statement transaction.  If it is a single statement
+    in multi-statement transaction, then only the changes in that 
+    statement are rolled back.
+*/
 int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
   warp_trx* trx = warp_get_trx(hton, thd);
-  
+  //if a statement failed, we need to rollback the insertions
+  //
   if(trx->autocommit || rollback_trx) {
     if(trx->dirty) {
-     warp_state->mark_transaction_closed(trx->trx_id);
+      // undo the changes and close the bitmap
+      warp_state->delete_bitmap->rollback();  
+
+      // remove the transaction from the open list
+      warp_state->mark_transaction_closed(trx->trx_id);
     }
+    // destroy the transaction
     delete trx;
     thd->get_ha_data(hton->slot)->ha_ptr = NULL;
+  } else {
+    //statement rollback
+    if(trx->dirty) {
+      // roll back any deletes in this statement
+      warp_state->delete_bitmap->rollback_to_savepoint();
+    
+      // now we update the delete bitmap to undo the inserts
+      if(trx->insert_log != NULL) {
+        trx->rollback_inserts();
+      }
+    }
   }
   
   return 0;
@@ -2654,7 +2651,6 @@ bool ha_warp::is_visible_to_read(uint64_t row_trx_id) {
   if(last_trx_id != row_trx_id) {
     last_trx_id = row_trx_id;
     if(current_trx->trx_id == row_trx_id || row_trx_id == 0) {
-      dbug("ELEPHANT");
       is_visible = true;
     } else {
       if(
@@ -2662,15 +2658,11 @@ bool ha_warp::is_visible_to_read(uint64_t row_trx_id) {
         && row_trx_id > current_trx->trx_id
         // && warp_is_trx_open(row_trx_id)
       ) { 
-        dbug("NEPHER");
         is_visible = false;
       } else {
-        dbug("POOKS");
         if(warp_state->commit_bitmap->is_set(row_trx_id)) {
-          dbug("XXX");
           is_visible = true;
         } else {
-          dbug("YYY");
           is_visible = false;
         }
       }
@@ -2775,6 +2767,43 @@ warp_global_data::warp_global_data() {
   }  
 
   if(!shutdown_ok) {
+    DIR *dir = opendir(".");
+    struct dirent* ent;
+    const char trxlog_file_extension[7] = ".txlog";
+    if(dir == NULL) {
+      sql_print_error("Could not open directory entry for data directory");
+      assert(false);
+    }
+    // find any insertion logs and remove them - there is no need to roll
+    // back the insertions, the transactions associated with them will
+    // not be in the commit bitmap and any deletions associated with
+    // those transactions will be rolled back automatically when the
+    // bitmaps are opened
+    while((ent = readdir(dir)) != NULL) {
+      // skip the deleted and commit bitmaps
+      if(ent->d_name[0] == 'c' || ent->d_name[0] == 'd') {
+        char* ext_at = ent->d_name;
+        int filename_len = strlen(ent->d_name);
+        bool found = false;
+        for(int i = 0; i< filename_len; ++i) {
+          if(*(ext_at + i) == '.') {
+            found = true;
+            break;
+          }
+        }
+        if(!found) {
+            continue;
+        }
+        if(strncmp(trxlog_file_extension,ext_at, 6) == 0) {
+          // found a txlog to remove
+          if(unlink(ent->d_name) != 0) {
+            sql_print_error("Could not remove transaction log %s", ent->d_name);
+            assert(false);
+          }
+        }
+      }
+    }
+    
     if(!repair_tables()) {
       assert("Table repair failed. Database could not be initialized");
     }
@@ -2788,6 +2817,13 @@ warp_global_data::warp_global_data() {
     commit_bitmap = new sparsebitmap(commit_bitmap_file, LOCK_SH); 
   } catch(...) {
     sql_print_error("Could not open commit bitmap: %s", commit_bitmap_file.c_str());
+    assert(false);
+  }
+  // this will create the commits.warp bitmap if it does not exist
+  try {
+    delete_bitmap = new sparsebitmap(delete_bitmap_file, LOCK_SH); 
+  } catch(...) {
+    sql_print_error("Could not open delete bitmap: %s", delete_bitmap_file.c_str());
     assert(false);
   }
   
@@ -2853,9 +2889,9 @@ uint64_t warp_global_data::get_next_trx_id() {
 uint64_t warp_global_data::get_next_rowid_batch() {
   mtx.lock();
   next_rowid += 10;
-  return next_rowid;
   write();
   mtx.unlock();
+  return next_rowid;
 }
 
 void warp_global_data::register_open_trx(uint64_t trx_id) {
@@ -2881,6 +2917,176 @@ bool warp_global_data::is_transaction_open(uint64_t trx_id) {
   }
   mtx.unlock();
   return retval;
+}
+
+int warp_global_data::create_lock(uint64_t rowid, warp_trx* trx, int lock_type) {
+  uint spin_count = 0;
+  struct timespec sleep_time;
+  struct timespec remaining_time;
+  sleep_time.tv_sec = (time_t)0;
+  sleep_time.tv_nsec = 100000000L; // sleep a millisecond
+  // each sleep beyond the spin locks increments the 
+  // waiting time
+  ulonglong max_wait_time = THDVAR(trx->thd, lock_wait_timeout);
+  ulonglong wait_time = 0;
+  // create a new lock for our lock
+  // will be deleted and replaced if 
+  // we discover we already have this 
+  // lock!  
+  warp_lock new_lock;
+  new_lock.holder = trx->trx_id;
+  new_lock.waiting_on = 0;
+  new_lock.lock_type = lock_type;
+retry_lock:
+  lock_mtx.lock();
+  // this is used to iterate over all the locks held
+  // for this row.  
+  auto it = row_locks.find(rowid);
+
+  // check to see if any row locks exist for this
+  // row
+  if(it == row_locks.end()) {
+    // row is not locked so lock can proceed without
+    // checking anything further!
+    row_locks.insert(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+    lock_mtx.unlock();
+    return lock_type;
+  } else {
+    // row is already locked
+    for(auto it2 = it;it2 != row_locks.end();++it2) {
+      dbug("lock search");
+      warp_lock test_lock = it2->second;
+
+      // this lock will be released because of deadlock
+      // so go to sleep and wait for it to be released
+      // so that we don't possibly hit another deadlock
+      // from the same trx before all the locks are 
+      // released as the transaction closes
+      if(test_lock.lock_type == LOCK_DEADLOCK) {
+        dbug("lock is a detected deadlock - waiting for trx rollback to free lock");
+        lock_mtx.unlock();
+        it2 = it;
+        goto sleep;
+      }
+
+      // if the row was possibly modified in a newer transaction
+      // then return the HISTORY lock.  The row will still be 
+      // visible to older read views
+      if(trx->trx_id < new_lock.holder && test_lock.lock_type == LOCK_HISTORY) {
+        dbug("lock is a history lock - returning lock");
+        lock_mtx.unlock();
+        return lock_type;
+      }
+
+      // the current transaction already holds a lock on this row
+      if(test_lock.holder == trx->trx_id) {
+        dbug("current trx holds a lock already");
+        if(test_lock.waiting_on != 0) {
+          dbug("lock is waiting for trx close");
+          // does the waiting transaction still exist?
+          if(is_transaction_open(test_lock.waiting_on)) {
+            dbug("locking trx still exists - waiting");
+            lock_mtx.unlock();
+            goto sleep;
+          }
+          dbug("transaction is closed!");
+          new_lock.waiting_on = 0;
+          row_locks.erase(it);
+          row_locks.insert(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+          lock_mtx.unlock();
+          dbug("returning lock");
+          return lock_type;
+        }
+        if(test_lock.lock_type >= lock_type) {
+          dbug("sufficient lock already acquired");
+          // this transaction already has a strong enough lock on this row
+          // no need to insert the new lock and just return the lock 
+          mtx.unlock();
+          return lock_type; 
+        } 
+        dbug("lock upgrade required");
+        row_locks.erase(it);
+        it2 = it;
+        continue;
+      }
+      
+      // this lock is a shared lock by somebody else
+      // and this lock request is for a shared lock
+      // so keep searching - we will grant the lock request
+      // as long as no conflicting EX_LOCK is found
+      // AND as long as this lock is not waiting on another
+      // transaction
+      if(test_lock.lock_type == LOCK_SH && new_lock.lock_type == LOCK_SH) {
+        dbug("shared lock on row detected");
+        // if the existing  shared lock is not waiting on an EX lock
+        // the shared lock can be granted, othewrise
+        // we have to wait on this lock
+        if(test_lock.waiting_on == 0) {
+          dbug("shared lock is not waiting");
+          // iterate because this trx might already hold a shared lock 
+          // to reuse
+          continue;
+        }
+        // the shared lock is waiting on an EX lock!
+        // can not acquire the shared lock right now
+        // will sleep a bit if spinlocks are exhausted and 
+        // will error out if lock_wait_timeout is exhausted
+        dbug("waiting on shared lock");
+        new_lock.waiting_on = test_lock.waiting_on;
+        row_locks.insert(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+        lock_mtx.unlock();
+        goto sleep;
+      }
+      
+      // If new_lock points to an existing lock and the 
+      // other transaction is already waiting on this
+      // lock, then a DEADLOCK is detected!
+      // this transaction will be rolled back
+      if(lock_type == LOCK_EX && test_lock.waiting_on == new_lock.holder) {
+        dbug("deadlock detected");
+        new_lock.lock_type = LOCK_DEADLOCK;
+        row_locks.insert(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+        lock_mtx.unlock();
+        return LOCK_DEADLOCK;
+      }
+      dbug("continuing search");  
+    }
+    dbug("search completed!");
+  }  
+  
+  new_lock.waiting_on = 0;
+  // insert the new lock
+  row_locks.insert(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+  
+  lock_mtx.unlock();
+  dbug("returning lock");
+  return lock_type;
+
+sleep:
+  //fixme - make this configurable
+  if(spin_count++ > 0) {
+    dbug("sleeping");
+    
+    int err = nanosleep(&sleep_time, &remaining_time);
+    if(err < 0) {
+      if(err == EINTR) {
+        sleep_time=remaining_time;
+        goto sleep;
+      }
+      return ER_LOCK_ABORTED;
+     } 
+  }
+  wait_time += sleep_time.tv_nsec;
+  if(wait_time >= max_wait_time) {
+    return ER_LOCK_WAIT_TIMEOUT;
+  }
+  // lock sleep completed 
+  dbug("retry lock");
+  goto retry_lock;
+
+  // never reached
+  return -1;
+  
 }
 
 /* When the database shuts down clean it writes the
@@ -2956,7 +3162,6 @@ void warp_global_data::write_clean_shutdown() {
 // would be corrupted!  
 void warp_global_data::write() {
   struct on_disk_state record;
-  mtx.lock();
   // write the second record
   memset(&record, 0, sizeof(struct on_disk_state));
   // write the second record first.  If this fails, then the
@@ -3011,7 +3216,6 @@ void warp_global_data::write() {
     sql_print_error("fsync to database state failed");
     assert(false);
   }
-  mtx.unlock();
 }
 
 warp_global_data::~warp_global_data() {

@@ -40,17 +40,10 @@
 class sparsebitmap
 {
 private:
-  int debug_flag;
   int line;
-  int dirty;
+  int dirty=0;
   int have_lock=LOCK_UN;
   unsigned long long fpos = 0;
-
-  inline void debug(std::string message) {
-    if(debug_flag) {
-      std::cerr << line << ":" << message << "\n";
-    }
-  } 
 
 public:
   bool is_dirty() {
@@ -63,7 +56,9 @@ private:
   void unlock() { 
     dbug("unlock");
     if(have_lock == LOCK_UN) return;
+    dbug("FILIPPA");
     flock(fileno(fp), LOCK_UN); 
+    dbug("FILIPPA1");
     have_lock = LOCK_UN; 
   }
 
@@ -78,8 +73,8 @@ private:
   unsigned long long bits; 
 
   /* File pointers for data and log */
-  FILE *fp; 
-  FILE *log; 
+  FILE *fp=NULL; 
+  FILE *log=NULL; 
 
   /* type of rwlock held by index */
   int lock_type; 
@@ -103,18 +98,25 @@ private:
   int replay (int mode=MODE_UNSET) {
     dbug("replay");
     fseek(log,0,SEEK_SET);
+    clearerr(log);
     fpos = 0;
     unsigned long long bitnum;
     while(!feof(log)) {
       bitnum = 0;
       int sz = fread(&bitnum,1,sizeof(bitnum), log);
       if(sz == 0) break;
-      set_bit(bitnum, mode);
+      // bitnum 0 marks a commit
+      // bitnum 2 marks a savepoint
+      if(bitnum > 10) {
+        set_bit(bitnum-10, mode);
+      }
     }
     fsync(fileno(fp));
     
     return 0;
   }
+
+  
 
   /* detect the commit marker ($) at the end of the file.
    * if the marker is found, then replay all the changes
@@ -161,13 +163,10 @@ private:
       log = fopen(lname.c_str(), "rb+");
     }
 
-    /* FIXME: 
-     * recovery failed at this point
-     * */ 
     if(!log) { 
       recovering = 0; 
       dirty=0;
-      return -1; 
+      throw(1); 
     }
     dbug("STARTING RECOVERY");
     // start recovery
@@ -183,12 +182,8 @@ private:
     // roll forward or roll back the changes
     int res = replay(mode);
     if(res) {
-      /* FIXME:
-       * recovery failed at this point
-       * */ 
       fclose(log);
-      recovering = 0;
-      return res;
+      throw(res);
     }
 
     close(1);
@@ -198,14 +193,16 @@ private:
   }
 
 public:
-	sparsebitmap(std::string filename,int lock_mode = LOCK_SH,int verbose = 0) {
+	sparsebitmap(std::string filename,int lock_mode = LOCK_SH) {
     dbug("construct");
     fp = NULL; 
     log = NULL;
     bits = 0;
-    debug_flag = verbose;
-    open(filename, lock_mode);
-  };
+    int open_state = open(filename, lock_mode);
+    if(open_state != 0) {
+      throw(open_state);
+    }
+  }
 
 	~sparsebitmap() {
     unlock();
@@ -213,12 +210,16 @@ public:
     if(log) { fsync(fileno(log)); fclose(log); }
   };
 
+  std::string get_fname() {
+    return fname;
+  }
+
   /* -1 means already open */
   /* -2 means could not create*/
   /* -3 means could not open*/
   int open(std::string filename, int lock_mode = LOCK_SH) {
     dbug("open");
-    close();
+    if(fp != NULL) close();
     bits = 0;
     int skip_recovery = 0;
     
@@ -237,7 +238,6 @@ public:
     fp = fopen(filename.c_str(),"rb+");
     if(!fp) return -3;    
 
-
     /* if commit marker is in log, replay the log, otherwise
      * undo changes from the log
      */
@@ -251,13 +251,16 @@ public:
     /* open the log */ 
     if(lock_mode == LOCK_EX) {
       log = fopen(lname.c_str(),"wb");
+      if(!log) {
+        return -4;
+      }
     }
 
     /* read in the first block of bits */
     bits = 0;
     fread(&bits, BLOCK_SIZE, 1, fp);
     fseek(fp, 0, SEEK_SET);
-    
+        
     fpos = 0;
     dirty = 0;
     dbug("bits at open: " + std::to_string(bits));
@@ -275,7 +278,9 @@ public:
     if(fp) fsync(fileno(fp));
     if(log) fsync(fileno(log));
     if(unlink_log) unlink(lname.c_str());
+    dbug("NIMANANANA");
     unlock();
+    dbug("NIMANANANA1");
     if(fp) fclose(fp);
     if(log) fclose(log);
 
@@ -286,22 +291,97 @@ public:
 
     return 0;
   } 
+  /* Find the highest bit set in the bitmap. 
+     returns 0 if a bit was found
+     returns -1 if no bits were found
+     returns -2 on error
 
+     Note: Unless bits are explicitly set to zero in the bitmap,
+     this should always read only the last BLOCK_SIZE (8 bytes)
+     from the file.
+  */
+  int get_last_set_bit(uint64_t &last_bit) {
+    if(!fp) {
+      open(fname, LOCK_SH);
+    } else {
+      lock(LOCK_SH);
+    }
+    if(!fp) {
+      return -2;
+    }
+    last_bit = 0;
+    fseek(fp, -BLOCK_SIZE, SEEK_END);
+    fpos = ftell(fp);
+    do {
+      size_t sz = fread(&bits, BLOCK_SIZE, 1, fp);
+      if(sz != 1 && fpos == 0) { 
+        if(ferror(fp)) return -2;
+        /* no bits set */
+        return -1;
+      }
+
+      int bitnum = BLOCK_SIZE * 8;
+      do {
+        if((bits >> bitnum) & 1) {
+          last_bit = (BLOCK_SIZE * fpos) + bitnum;
+          return 0;
+        } 
+        --bitnum;
+      } while(bitnum>0);
+      fpos -= BLOCK_SIZE;
+      fseek(fp, -BLOCK_SIZE, SEEK_CUR);
+    } while (fpos > 0);
+
+    /* no bits are set */
+    last_bit = 0;
+    return -1; 
+  }
+
+  /* Find the last bit in the last black of bitmap. 
+     Note: if this bit is zero, it may not have been
+     explicity set to 0!
+     returns -2 on error
+  */
+ int get_last_bit(uint64_t &last_bit) {
+    if(!fp) {
+      open(fname, LOCK_SH);
+    } else {
+      lock(LOCK_SH);
+    }
+    if(!fp) {
+      return -2;
+    }
+    last_bit = 0;
+    //assert(fseek(fp, 0, SEEK_END) == 0);
+    struct stat st;
+    if(stat(fname.c_str(), &st)) return 0;
+    //fpos = ftell(fp);
+    fprintf(stderr,"FPOS Is %s\n", std::to_string(st.st_size).c_str());
+    fflush(stderr);
+    last_bit = (BLOCK_SIZE * st.st_size) + (BLOCK_SIZE * 8);
+    return 0;
+  }
 
   /* sync the changes to disk, first the log
    * and then the data file */
   int commit() {
     dbug("commit");
+    dbug("FALOOTIN0");
     if(dirty) {
+      dbug("FALOOTIN2");
       dbug("bitmap is dirty - writing commit marker");
+      dbug(fname.c_str());
       int zero=0;
       int sz = fwrite(&zero, BLOCK_SIZE, 1, log);
+      dbug("FALOOTIN3");
       fsync(fileno(log));
       fsync(fileno(fp));
-      close(1);
       dirty = 0;
+      dbug("ZANG");
+      close(1);
       return !(sz == 1);
     }
+    dbug("FALOOTIN4");
     return 0;
   }
 
@@ -316,27 +396,32 @@ public:
     dbug("is_set: bit " + std::to_string(bitnum));
     if(!fp) open(fname, LOCK_SH);
     lock(LOCK_SH);
+    
     int bit_offset;
     unsigned long long at_byte = (bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1;
     if(at_byte != fpos) {
       fseek(fp, at_byte, SEEK_SET);
       fpos = at_byte;
       size_t sz = fread(&bits, BLOCK_SIZE, 1, fp);
-      if(sz == 0 || feof(fp)) return 0;
+      
+      if(sz == 0 || feof(fp)) { 
+        dbug("ZOOMBA");
+        return 0;
+      }
     }
-    dbug("IN IS SET bits: " + std::to_string(bits));
-    int retval =  (bits >> bit_offset) & 1; 
+    int retval = (bits >> bit_offset) & 1; 
     dbug("IN IS SET retval: " + std::to_string(retval));
-    return retval;
+    return retval ;
   }
 
   /* set a bit in the index */
-  /* 1 = successful write */
+  /*  0 = successful write */
   /* -1 = logging failure (no change to index) */
-  /* 0 = index read/write failure  */
+  /* -2 = index read/write failure  */
   inline int set_bit(unsigned long long bitnum, int mode = MODE_SET) {
     dbug("set_bit");
     if(!fp || have_lock != LOCK_EX) open(fname, LOCK_EX);
+      
     /*
     bool force_read = false;
     if(dirty == 0) {
@@ -347,8 +432,11 @@ public:
     // write-ahead-log (only write when not in recovery mode) 
     // sz2 will be <1 on write error
     size_t sz=0;
-    if(!recovering) sz = fwrite(&bitnum, BLOCK_SIZE, 1, log);
-    if(!recovering && sz != BLOCK_SIZE) return -1;
+    if(!recovering) {
+      uint64_t log_bitnum = bitnum + 10;
+      sz = fwrite(&log_bitnum, BLOCK_SIZE, 1, log);
+      if(sz != 1) return -1;
+    }
 
     if(lock_type != LOCK_EX) lock(LOCK_EX);
 
@@ -358,13 +446,12 @@ public:
     /* where to read at in file */
     unsigned long long at_byte = (bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1;
 
-    /* read the bits into memory */
-    //if(force_read || at_byte != fpos) {
+    /* read the bits into memory if necessary */
     if(at_byte != fpos) {
       fpos = at_byte;
       fseek(fp, at_byte, SEEK_SET);
       sz = fread(&bits, BLOCK_SIZE, 1, fp);
-      if(ferror(fp)) return 0;
+      if(ferror(fp)) return -2;
       if(sz == 0 || feof(fp)) bits = 0;
     }
     
@@ -381,9 +468,52 @@ public:
     sz = fwrite(&bits, BLOCK_SIZE, 1, fp);
     /* position back so that we don't read the block in again*/
     fseek(fp, at_byte, SEEK_SET); 
-    return sz == 1;
+    return sz == 1 ? 0 : -2;
   }
 
+  // todo: support numbered savepoints
+  int create_savepoint() {
+    dbug("create_savepoint");
+    if(!fp || have_lock != LOCK_EX) open(fname, LOCK_EX);
+    uint64_t marker = 2;
+    int sz = fwrite(&marker, sizeof(marker), 1, log);
+    if(ferror(log) != 0 || sz != 1) {
+      sql_print_error("Could not write savepoint to delete bitmap transaction log");
+      assert(false);
+    }
+    return 0;
+  }
+
+  // todo: support numbered savepoints
+  int rollback_to_savepoint() {
+    dbug("RBTS");
+    clearerr(log);
+    fseek(log, 0, SEEK_SET);
+    uint64_t log_fpos = 0;
+    unsigned long long bitnum;
+    do {
+      bitnum = 0;
+      int sz = fread(&bitnum,1,BLOCK_SIZE, log);
+      log_fpos = ftell(log);
+      if(sz == 0) break;
+    } while(bitnum != 2);
+    if(feof(log)) {
+      // savepoint not found
+      return 0;
+    }
+    uint64_t savepoint_pos = log_fpos - BLOCK_SIZE;
+    while(true) {
+      int sz = fread(&bitnum,1,BLOCK_SIZE, log);
+      if(sz == 0) {
+        break;
+      }
+      set_bit(bitnum, MODE_UNSET);
+    }
+    ftruncate(fileno(log), savepoint_pos);
+    fsync(fileno(log));
+    fsync(fileno(fp));
+    return 0;
+  }
 
 };
 #endif

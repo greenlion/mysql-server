@@ -29,6 +29,8 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <dirent.h>
+#include <string.h>
 
 #include "my_dir.h"
 #include "my_inttypes.h"
@@ -67,6 +69,8 @@
 #include <vector>
 #include <thread>
 #include <forward_list>
+#include <unordered_map>
+#include <time.h>
 
 #include "include/fastbit/ibis.h"
 #include "include/fastbit/query.h"
@@ -95,7 +99,7 @@ static const char *ha_warp_exts[] = {
 };
 
 /* engine variables */
-static unsigned long long my_partition_max_rows, my_cache_size, my_write_cache_size;
+static unsigned long long my_partition_max_rows, my_cache_size, my_write_cache_size;//, my_lock_wait_timeout;
 
 static MYSQL_SYSVAR_ULONGLONG(
   partition_max_rows,
@@ -125,23 +129,47 @@ static MYSQL_SYSVAR_ULONGLONG(
 
 static MYSQL_SYSVAR_ULONGLONG(
   write_cache_size,
-  my_write_cache_size,
+  my_cache_size,
   PLUGIN_VAR_RQCMDARG,
-  "The number of rows to cache in ram before flushing to disk.",
+  "Fastbit file cache size",
   NULL,
   NULL,
-  1024 * 1024,
-  1024 * 1024,
+  1024ULL * 1024 * 1024 * 4,
+  1024ULL * 1024 * 1024 * 4,
   1ULL<<63,
   0
 );
+
+/*
+static MYSQL_SYSVAR_ULONGLONG(
+  lock_wait_timeout,
+  my_lock_wait_timeout,
+  PLUGIN_VAR_RQCMDARG,
+  "Timeout in seconds a WARP transaction may wait "
+  "for a lock before being rolled back.",
+  NULL,
+  NULL,
+  1,
+  50,
+  ULONG_MAX,
+  0
+);
+*/
+
+static MYSQL_THDVAR_ULONG(lock_wait_timeout, PLUGIN_VAR_RQCMDARG,
+                          "Timeout in seconds a WARP transaction may wait "
+                          "for a lock before being rolled back.",
+                          nullptr, nullptr, 50, 0, ULONG_MAX, 0);
+
 
 SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(partition_max_rows),
   MYSQL_SYSVAR(cache_size),
   MYSQL_SYSVAR(write_cache_size),
+  MYSQL_SYSVAR(lock_wait_timeout),
   NULL
 };
+
 
 struct WARP_SHARE {
   std::string table_name;
@@ -152,20 +180,100 @@ struct WARP_SHARE {
   THR_LOCK lock;
 };
 
+// used as a type of lock to provide consistent snapshots
+// to deleted rows not visible to older transactions
+// when a write lock is freed it is downgraded to a 
+// visibility lock.  when a transaction closes, any
+// locks HISTORY locks older than that transaction are
+// also freed
 
-//std::mutex warp_state_io_mtx;
+// history locks are for read consistent views after
+// rows are deleted.  they are freed when the 
+// all the transactions older then them have
+// been closed.  When an EX lock is freed it is
+// downgraded to a LOCK_HISTORY lock if any
+// changes were made to the row under the EX lock
+#define LOCK_HISTORY -1
 
-// used to protect the global state data
+// if a lock acquisition results in a deadlock then
+// LOCK_DEADLOCK is returned from create_lock()
+#define LOCK_DEADLOCK -2
 
+class warp_lock {
+  public:
+  // trx_id that holds this lock
+  uint64_t holder;
+
+  //trx_id that this lock is waiting on
+  uint64_t waiting_on;
+
+  //lock type:LOCK_EX, LOCK_SH, LOCK_HISTORY, LOCK_DEADLOCK
+  int lock_type = 0;
+};
+
+//Holds the state of a WARP transaction.  Instantiated in ::external_lock
+//or ::start_stmt
+class warp_trx {
+  public:
+  // used to log inserts during an insertion.  If a statement rolls
+  // back this is used to undo the insert statements
+  FILE* insert_log = NULL;
+  std::string insert_log_filename = "";
+  //bitmap to mark deleted rows into during insert rollback
+  sparsebitmap* deleted_bitmap = NULL;
+
+  //the transaction identifier 
+  ulonglong trx_id = 0;
+
+  //number of table locks (read or write) held by the transaction
+  uint64_t lock_count = 0;
+
+  //number of background writers that are doing work.  The commit
+  //function must wait for this counter to reach zero before a 
+  //transaction can be committed
+  uint64_t background_writer_count = 0;
+
+  THD* thd = NULL;
+  handlerton* hton; 
+
+  //the transaction was not a read-only transaction and it 
+  //modified rows in the database, so it must be writen into
+  //the commit bitmap when it commmits
+  bool dirty = false;
+
+  //autocommit statements commit each time the commit function
+  //is called
+  bool autocommit = false;
+
+  //selected transaction isolation level.  Only SERIALIZABLE,
+  //REPEATABLE-READ and READ-COMMITTED are actually supported
+  enum enum_tx_isolation isolation_level;
+
+  //called when transactions start
+  int begin();
+  
+  //called when transcations end
+  void commit();
+
+  //never actually called but here for completeness if 
+  //needed in the future
+  void rollback_inserts();
+  void write_insert_log_rowid(uint64_t rowid);
+  void open_insert_log();
+};
 
 class warp_global_data {
   private:
   // held when reading or modifying state
   std::mutex mtx;
+  // used when reading/modifying the lock structures
 
+  std::mutex lock_mtx;
   std::string shutdown_clean_file = "shutdown_clean.warp";
   std::string warp_state_file     = "state.warp";
   std::string commit_bitmap_file  = "commits.warp";
+  std::string delete_bitmap_file  = "deletes.warp";
+
   uint64_t rowid_batch_size = 10000;
 
   // each write to the state file increments the state counter
@@ -208,9 +316,13 @@ class warp_global_data {
     uint64_t state_counter;
   };
 
+  
+
   // handle to the warp state
   FILE* fp = NULL;
 
+  std::unordered_multimap<uint64_t, warp_lock> row_locks;
+  
   // write the current state to the state file
   void write();
 
@@ -237,7 +349,7 @@ class warp_global_data {
   // the mutex does not need to be held to modify 
   // the commit bitmap
   sparsebitmap* commit_bitmap = NULL;
- 
+  sparsebitmap* delete_bitmap = NULL;
   // opens and reads the state file.  
   // if the on-disk version of data is older than the current verion
   // the database will be upgraded.  If the on disk version is newer
@@ -256,6 +368,9 @@ class warp_global_data {
   bool is_transaction_open(uint64_t check_trx_id);
   void mark_transaction_closed(uint64_t trx_id);
   void register_open_trx(uint64_t trx);
+
+  int create_lock(uint64_t lock_id, warp_trx* trx, int lock_type);
+  int free_locks(warp_trx* trx);
 
 };
 
@@ -277,49 +392,6 @@ int warp_rollback(handlerton *, THD *, bool);
 //Called by the warp_state constructor to upgrade on disk tables when
 //the on-disk version is older than the current version
 int warp_upgrade_tables(uint16_t version);
-
-//Holds the state of a WARP transaction.  Instantiated in ::external_lock
-//or ::start_stmt
-class warp_trx {
-  public:
-  //the transaction identifier 
-  ulonglong trx_id = 0;
-
-  //number of table locks (read or write) held by the transaction
-  uint64_t lock_count = 0;
-
-  //number of background writers that are doing work.  The commit
-  //function must wait for this counter to reach zero before a 
-  //transaction can be committed
-  uint64_t background_writer_count = 0;
-
-  THD* thd = NULL;
-  handlerton* hton; 
-
-  //the transaction was not a read-only transaction and it 
-  //modified rows in the database, so it must be writen into
-  //the commit bitmap when it commmits
-  bool dirty = false;
-
-  //autocommit statements commit each time the commit function
-  //is called
-  bool autocommit = false;
-
-  //selected transaction isolation level.  Only SERIALIZABLE,
-  //REPEATABLE-READ and READ-COMMITTED are actually supported
-  enum enum_tx_isolation isolation_level;
-  std::unordered_set<std::string> tables; 
-
-  //called when transactions start
-  int begin();
-  
-  //called when transcations end
-  void commit();
-
-  //never actually called but here for completeness if 
-  //needed in the future
-  void rollback();
-};
 
 // determines is a transaction_id is an open transaction
 // used for UNIQUE check visibility during inserts
@@ -378,7 +450,7 @@ class ha_warp : public handler {
   */
   sparsebitmap*        deleted_bitmap     = NULL;  
   sparsebitmap*        commit_bitmap      = NULL;    
-  //FILE*                commit_log         = NULL; 
+  FILE*                insert_log         = NULL; 
 
   /* WHERE clause constructed from engine condition pushdown */
   std::string          push_where_clause  = "";
