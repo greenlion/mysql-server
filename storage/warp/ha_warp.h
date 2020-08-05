@@ -81,10 +81,12 @@
 #include "include/fastbit/resource.h"
 #include "include/fastbit/util.h"
 
-#include "sparse.hpp"
-
 #include "sql/sql_thd_internal_api.h"
 
+// used for debugging in development
+#define dbug(x) std::cerr << __LINE__ << ": " << x << "\n"; 
+
+#include "sparse.hpp"
 /*
   Version for file format.
   1 - Initial Version. That is, the version when the metafile was introduced.
@@ -199,6 +201,11 @@ struct WARP_SHARE {
 // LOCK_DEADLOCK is returned from create_lock()
 #define LOCK_DEADLOCK -2
 
+// select FOR UPDATE takes READ_EX locks which can
+// be converted to a LOCK_EX without checking
+// for deadlocks
+#define WRITE_INTENTION -3
+
 class warp_lock {
   public:
   // trx_id that holds this lock
@@ -211,17 +218,44 @@ class warp_lock {
   int lock_type = 0;
 };
 
+// markers for the transaction logs
+const char begin_marker     = 1;
+const char insert_marker    = 2;
+const char delete_marker    = 3;
+const char commit_marker    = 4;
+const char rollback_marker  = 5;
+const char savepoint_marker = 6;
+#define ROLLBACK_STATEMENT 0
+
+  
 //Holds the state of a WARP transaction.  Instantiated in ::external_lock
 //or ::start_stmt
 class warp_trx {
   public:
   // used to log inserts during an insertion.  If a statement rolls
   // back this is used to undo the insert statements
-  FILE* insert_log = NULL;
-  std::string insert_log_filename = "";
-  //bitmap to mark deleted rows into during insert rollback
-  sparsebitmap* deleted_bitmap = NULL;
+  FILE* log = NULL;
+  std::string log_filename = "";
+  bool registered = false;
+  bool table_lock = false;
+  
+  // set when a statement is a DML statement
+  // forces UPDATE and DELETE statements 
+  // to be read-committed
+  bool is_dml = false;
 
+  // set when a SELECT has LOCK IN SHARE MODE as
+  // part of the SELECT clause - takes shared locks
+  // for each traversed visible row
+  bool lock_in_share_mode = false;
+
+  // when FOR UPDATE is in a SELECT clause
+  // LOCK_EX is taken on traversed visible rows
+  bool for_update = false;
+
+  // held during commit and rollback
+  std::mutex commit_mtx;
+  
   //the transaction identifier 
   ulonglong trx_id = 0;
 
@@ -255,11 +289,10 @@ class warp_trx {
   //called when transcations end
   void commit();
 
-  //never actually called but here for completeness if 
-  //needed in the future
-  void rollback_inserts();
+  void rollback(bool all);
   void write_insert_log_rowid(uint64_t rowid);
-  void open_insert_log();
+  void write_delete_log_rowid(uint64_t rowid);
+  void open_log();
 };
 
 class warp_global_data {
@@ -269,6 +302,7 @@ class warp_global_data {
   // used when reading/modifying the lock structures
 
   std::mutex lock_mtx;
+  std::mutex history_lock_mtx;
   std::string shutdown_clean_file = "shutdown_clean.warp";
   std::string warp_state_file     = "state.warp";
   std::string commit_bitmap_file  = "commits.warp";
@@ -316,13 +350,15 @@ class warp_global_data {
     uint64_t state_counter;
   };
 
-  
-
   // handle to the warp state
   FILE* fp = NULL;
 
+  //rowid, warp_lock object
   std::unordered_multimap<uint64_t, warp_lock> row_locks;
   
+  // rowid, trx_id
+  std::unordered_map<uint64_t, uint64_t> history_locks;
+
   // write the current state to the state file
   void write();
 
@@ -370,7 +406,10 @@ class warp_global_data {
   void register_open_trx(uint64_t trx);
 
   int create_lock(uint64_t lock_id, warp_trx* trx, int lock_type);
+  int unlock(uint64_t rowid, warp_trx* trx);
+  int downgrade_to_history_lock(uint64_t rowid, warp_trx* trx);
   int free_locks(warp_trx* trx);
+  uint64_t get_history_lock(uint64_t rowid);
 
 };
 
@@ -545,7 +584,8 @@ class ha_warp : public handler {
   int external_lock(THD *thd, int lock_type);
   int start_stmt(THD *thd, thr_lock_type lock_type);
   int register_trx_with_mysql(THD* thd, warp_trx* trx);
-  bool is_visible_to_read(uint64_t row_trx_id);
+  bool is_trx_visible_to_read(uint64_t row_trx_id);
+  bool is_row_visible_to_read(uint64_t rowid);
   
   //int truncate(dd::Table *);
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
