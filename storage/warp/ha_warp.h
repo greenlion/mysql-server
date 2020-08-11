@@ -83,10 +83,10 @@
 
 #include "sql/sql_thd_internal_api.h"
 
-// used for debugging in development
-#define dbug(x) std::cerr << __LINE__ << ": " << x << "\n"; 
-
 #include "sparse.hpp"
+// used for debugging in development
+#define dbug(x) std::cerr << __LINE__ << ": " << x << "\n"; fflush(stdout)
+
 /*
   Version for file format.
   1 - Initial Version. That is, the version when the metafile was introduced.
@@ -131,13 +131,13 @@ static MYSQL_SYSVAR_ULONGLONG(
 
 static MYSQL_SYSVAR_ULONGLONG(
   write_cache_size,
-  my_cache_size,
+  my_write_cache_size,
   PLUGIN_VAR_RQCMDARG,
   "Fastbit file cache size",
   NULL,
   NULL,
-  1024ULL * 1024 * 1024 * 4,
-  1024ULL * 1024 * 1024 * 4,
+  1000000,
+  1000000,
   1ULL<<63,
   0
 );
@@ -181,6 +181,25 @@ struct WARP_SHARE {
   mysql_mutex_t mutex;
   THR_LOCK lock;
 };
+
+class warp_pushdown_information {
+ public:
+ std::unordered_map<std::string, std::string> filters;
+ std::unordered_map<std::string, std::string> alias_map;
+ std::unordered_map<std::string, Field **> fields;
+ // the table might be opened in engine_pushdown() for
+ // pushdown join optimization - if so, when the
+ // table is iterated over these pointers will be
+ // used instead of opening the table again.  This
+ // information is set during condition pushdown
+ // and persisted on the table handle after it completes
+ // and then the pointers are set to NULL
+ ibis::mensa* base_table;
+ ibis::table* filtered_table;
+};
+
+std::mutex pushdown_mtx;
+std::unordered_map<THD*, warp_pushdown_information*> pd_info;
 
 // used as a type of lock to provide consistent snapshots
 // to deleted rows not visible to older transactions
@@ -454,6 +473,7 @@ class ha_warp : public handler {
  bool is_visible = false;
  warp_trx* current_trx = NULL;
 
+
  private:
   void update_row_count();
   int reset_table();
@@ -473,8 +493,17 @@ class ha_warp : public handler {
   //void write_dirty_rows();
   int open_trx_log();
   int close_trx_log();
-  std::string make_unique_check_clause();
-  
+  std::string unique_check_where_clause = "";
+  bool table_checked_unique_keys = false;
+  bool table_has_unique_keys = false;
+  String key_part_tmp;
+  String key_part_esc;
+  bool has_unique_keys();
+  void make_unique_check_clause();
+
+  warp_pushdown_information* pushdown_info = NULL;
+  bool table_opened_in_pushdown = false;
+
   //std::mutex thd_lock;
 
   /* These objects are used to access the FastBit tables for tuple reads.*/ 

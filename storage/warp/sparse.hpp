@@ -33,7 +33,7 @@
 //#ifdef WARP_BITMAP_DEBUG
 #define bitmap_dbug(x) std::cerr << __LINE__ << ": " << x << "\n"; 
 //#else
-//#define bitmap_dbug(x) /* would write (x) to debug log*/
+//#define //bitmap_dbug(x) /* would write (x) to debug log*/
 //#endif
 
 class sparsebitmap
@@ -53,14 +53,14 @@ private:
 
   /* Index locking */ 
   void unlock() { 
-    bitmap_dbug("unlock");
+    //bitmap_dbug("unlock");
     if(have_lock == LOCK_UN) return;
     flock(fileno(fp), LOCK_UN); 
     have_lock = LOCK_UN; 
   }
 
   void lock(int mode) {
-    bitmap_dbug("lock");
+    //bitmap_dbug("lock");
     if(have_lock == LOCK_EX || have_lock == mode) return;
     flock(fileno(fp), mode);
     have_lock = mode;
@@ -85,14 +85,14 @@ private:
 
   /* check for file existance */
   bool exists(std::string filename) {
-    bitmap_dbug("exists");
+    //bitmap_dbug("exists");
     struct stat buf;
     return !stat(filename.c_str(), &buf);
   }
 
   /* replay the changes in the log, in either redo(MODE_SET) or undo(MODE_UNSET) */
   int replay (int mode=MODE_UNSET) {
-    bitmap_dbug("replay");
+    //bitmap_dbug("replay");
     fseek(log,0,SEEK_SET);
     clearerr(log);
     fpos = 0;
@@ -122,7 +122,7 @@ private:
    *  1 - recovery completed
    */ 
   int do_recovery() {
-    bitmap_dbug("do_recovery");
+    //bitmap_dbug("do_recovery");
     recovering = 0;
     struct stat buf;
     log = NULL;
@@ -161,7 +161,7 @@ private:
       dirty=0;
       throw(1); 
     }
-    bitmap_dbug("STARTING RECOVERY");
+    //bitmap_dbug("STARTING RECOVERY");
     // start recovery
     int mode=MODE_SET;
     fseek(log,-BLOCK_SIZE,SEEK_END);
@@ -187,7 +187,7 @@ private:
 
 public:
 	sparsebitmap(std::string filename,int lock_mode = LOCK_SH) {
-    bitmap_dbug("construct");
+    //bitmap_dbug("construct");
     fp = NULL; 
     log = NULL;
     bits = 0;
@@ -211,7 +211,7 @@ public:
   /* -2 means could not create*/
   /* -3 means could not open*/
   int open(std::string filename, int lock_mode = LOCK_SH) {
-    bitmap_dbug("open");
+    //bitmap_dbug("open");
     if(fp != NULL) close();
     bits = 0;
     int skip_recovery = 0;
@@ -256,16 +256,16 @@ public:
         
     fpos = 0;
     dirty = 0;
-    bitmap_dbug("bits at open: " + std::to_string(bits));
+    //bitmap_dbug("bits at open: " + std::to_string(bits));
 
     return 0;
   }
 
   /* close the index */
   int close(int unlink_log = 0) {
-    bitmap_dbug("close");
+    //bitmap_dbug("close");
     /* this will UNDO all the changes made to the index because commit() was not called*/
-    bitmap_dbug("dirty flag: " + std::to_string(dirty));
+    //bitmap_dbug("dirty flag: " + std::to_string(dirty));
     if(!recovering && dirty) do_recovery();
 
     if(fp) fsync(fileno(fp));
@@ -356,10 +356,10 @@ public:
   /* sync the changes to disk, first the log
    * and then the data file */
   int commit() {
-    bitmap_dbug("commit");
+    //bitmap_dbug("commit");
     if(dirty) {
-      bitmap_dbug("bitmap is dirty - writing commit marker");
-      bitmap_dbug(fname.c_str());
+      //bitmap_dbug("bitmap is dirty - writing commit marker");
+      //bitmap_dbug(fname.c_str());
       int zero=0;
       int sz = fwrite(&zero, BLOCK_SIZE, 1, log);
       fsync(fileno(log));
@@ -380,7 +380,7 @@ public:
   /* check to see if a particular bit is set */
   inline int is_set(unsigned long long bitnum) {
     assert(bitnum > 0);
-    bitmap_dbug("is_set: bit " + std::to_string(bitnum));
+    //bitmap_dbug("is_set: bit " + std::to_string(bitnum));
     if(!fp) open(fname, LOCK_SH);
     lock(LOCK_SH);
     
@@ -404,7 +404,7 @@ public:
   /* -1 = logging failure (no change to index) */
   /* -2 = index read/write failure  */
   inline int set_bit(unsigned long long bitnum, int mode = MODE_SET) {
-    bitmap_dbug("set_bit");
+    //bitmap_dbug("set_bit");
     assert(bitnum > 0);
     if(!fp || have_lock != LOCK_EX) open(fname, LOCK_EX);
       
@@ -460,7 +460,7 @@ public:
   /*
   // todo: support numbered savepoints
   int create_savepoint(uint64_t savepoint_num) {
-    bitmap_dbug("create_savepoint");
+    //bitmap_dbug("create_savepoint");
     if(!fp || have_lock != LOCK_EX) open(fname, LOCK_EX);
     std::string savepoint_fname = std::string("sp_") + fname + std::string("_") + std::to_string(savepoint_num) + std::string(".txlog");
     FILE* splog = fopen(savepoint_fname.c_str, "wb+");
@@ -473,7 +473,7 @@ public:
 
   // todo: support numbered savepoints
   int rollback_to_savepoint(uint64_t savepoint_num) {
-    bitmap_dbug("rollback_to_savepoint");
+    //bitmap_dbug("rollback_to_savepoint");
 
     clearerr(log);
     fseek(log, 0, SEEK_SET);
