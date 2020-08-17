@@ -204,11 +204,11 @@ ha_warp::ha_warp(handlerton *hton, TABLE_SHARE *table_arg)
   blobroot(warp_key_memory_blobroot, BLOB_MEMROOT_ALLOC_SIZE) 
 {
   warp_hton = hton;
-  unique_check_where_clause.reserve(128000);
-  key_part_tmp.reserve((max_key_part_length(NULL) * 4) + 1);
-  key_part_esc.reserve((max_key_part_length(NULL) * 4 * 2) + 1);
-  idx_where_clause.reserve(65535);
-  idx_where_clause = "";
+  //unique_check_where_clause.reserve(128000);
+  //key_part_tmp.reserve((max_key_part_length(NULL) * 4) + 1);
+  //key_part_esc.reserve((max_key_part_length(NULL) * 4 * 2) + 1);
+  //idx_where_clause.reserve(65535);
+  //idx_where_clause = "";
 }
 
 const char **ha_warp::bas_ext() const {  
@@ -864,6 +864,7 @@ void ha_warp::foreground_write() {
   maintain_indexes(share->data_dir_name, table);
 };
 
+/*
 bool ha_warp::has_unique_keys() {
   if(!table_checked_unique_keys) {
     table_checked_unique_keys = true;
@@ -879,7 +880,8 @@ bool ha_warp::has_unique_keys() {
   }
   return table_has_unique_keys;
 }
-
+*/
+/*
 void ha_warp::make_unique_check_clause() {
   unique_check_where_clause = "";
   // reserve space for max_key_part_length with a 4 byte character set
@@ -953,6 +955,7 @@ void ha_warp::make_unique_check_clause() {
     }
   }
 }
+*/
 
 /*
   This is an INSERT.  The row data is converted to CSV (just like the CSV
@@ -984,7 +987,7 @@ int ha_warp::write_row(uchar *buf) {
   // this function uses the table->field object to access the data
   // in the row buffer!
   
-  
+  /* 
   if(has_unique_keys() == true) {
     make_unique_check_clause();
     auto tbl = new ibis::mensa(share->data_dir_name); // base table
@@ -1070,6 +1073,7 @@ int ha_warp::write_row(uchar *buf) {
     
     if(errcode != 0) DBUG_RETURN(errcode);   
   }
+  */
   
   /* This will return a cached writer unless a background
     write was started on the last insert.  In that case
@@ -1107,23 +1111,22 @@ int ha_warp::write_row(uchar *buf) {
      statement, which is not optimal - maybe there is a 
      better solution
   */
-  if(unique_check_where_clause != "") {
+  /*if(unique_check_where_clause != "") {
     foreground_write();
     current_trx->write_insert_log_rowid(current_rowid);
-  } else if(writer->mRows() >= my_write_cache_size) {
-    /* spawn the background writer if the cache size is exceeded. */
+  } else
+  */
+  if(writer->mRows() >= my_write_cache_size) {
+    // spawn the background writer if the cache size is exceeded.
     ibis::tablex *writing_writer = writer;
     writer = NULL;
-    /* Spawn a background thread using a static method ha_warp::background_write
-    */
+    // Spawn a background thread using a static method ha_warp::background_write
     std::thread writer_thread(ha_warp::background_write, writing_writer,
                               share->data_dir_name, table, share);
 
     /* Don't worry about reaping the thread.  It will complete work and then exit.
     */
     writer_thread.detach();
-    // writer->write(share->data_dir_name,"_");
-    // writer->clearData();
   }
   DBUG_RETURN(0);
 }

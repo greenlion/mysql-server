@@ -230,13 +230,11 @@ class warp_pushdown_information {
   // than a tree index
   bool build_hash_index = false;
   
-  // in memory hash indexes
-  // these map lookup values like P_PartKey = 32 to the 
-  // row in the filtered_table cursor
-  std::unordered_multimap<std::string, uint64_t> string_to_row_map;
+  /*std::unordered_multimap<std::string, uint64_t> string_to_row_map;
   std::unordered_multimap<uint64_t, uint64_t> uint_to_row_map;
   std::unordered_multimap<int64_t, uint64_t> int_to_row_map;
   std::unordered_multimap<double, uint64_t> double_to_row_map;
+  */
 
   // free up the fastbit resources once the table is finshed
   // being used
@@ -542,7 +540,7 @@ class ha_warp : public handler {
   int reset_table();
   int encode_quote(uchar *buf);
   int set_column_set(); 
-  int set_column_set(uint32_t idxno);
+  //int set_column_set(uint32_t idxno);
   int find_current_row(uchar *buf, ibis::table::cursor* cursor);
   void create_writer(TABLE *table_arg);
   static int get_writer_partno(ibis::tablex* writer, char* datadir);
@@ -553,30 +551,28 @@ class ha_warp : public handler {
   void open_deleted_bitmap(int lock_mode = LOCK_SH);
   void close_deleted_bitmap();
   bool is_deleted(uint64_t rowid);
-  //void write_dirty_rows();
   int open_trx_log();
   int close_trx_log();
-  std::string unique_check_where_clause = "";
-  bool table_checked_unique_keys = false;
-  bool table_has_unique_keys = false;
-  String key_part_tmp;
-  String key_part_esc;
-  bool has_unique_keys();
-  void make_unique_check_clause();
-  //int bitmap_merge_join(Field* join_field, const char* dim_data_directory, warp_join_information dim_info);
+
+  //std::string unique_check_where_clause = "";
+  //bool table_checked_unique_keys = false;
+  //bool table_has_unique_keys = false;
+  //String key_part_tmp;
+  //String key_part_esc;
+  //bool has_unique_keys();
+  //void make_unique_check_clause();
+  //uint64_t lookup_in_hash_index(const uchar*, key_part_map, ha_rkey_function);
   int bitmap_merge_join();
-  uint64_t lookup_in_hash_index(const uchar*, key_part_map, ha_rkey_function);
   void cleanup_pushdown_info();
-  //std::mutex thd_lock;
 
   bool close_in_extra = false;
 
   /* These objects are used to access the FastBit tables for tuple reads.*/ 
   ibis::table*         base_table         = NULL; 
   ibis::table*         filtered_table     = NULL;
-  ibis::table*         idx_filtered_table = NULL;
   ibis::table::cursor* cursor             = NULL;
-  ibis::table::cursor* idx_cursor         = NULL;
+  //ibis::table*         idx_filtered_table = NULL;
+  //ibis::table::cursor* idx_cursor         = NULL;
 
   /* These objects are used by WARP to add functionality to Fastbit
      such as deletion/update of rows and transactions
@@ -589,8 +585,9 @@ class ha_warp : public handler {
   std::string          push_where_clause  = "";
   
   // used for index lookups
-  std::string          idx_where_clause   = "";
-  ibis::qExpr*         idx_qexpr;
+  //std::string          idx_where_clause   = "";
+  //ibis::qExpr*         idx_qexpr;
+  
   /* This object is used to append tuples to the table */
   ibis::tablex* writer = NULL;
 
