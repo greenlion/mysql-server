@@ -349,6 +349,7 @@ int ha_warp::encode_quote(uchar *) {
   buffer.append(std::to_string(current_rowid).c_str());
     
   /* add the transaction identifier */
+  current_trx=NULL;
   get_or_create_trx(table->in_use, current_trx);
   assert(current_trx != NULL);
   buffer.append(",");
@@ -2894,8 +2895,9 @@ int ha_warp::register_trx_with_mysql(THD* thd, warp_trx* trx) {
 int ha_warp::external_lock(THD *thd, int lock_type){ 
   //int trx_state = 0;
   int retval = 0;
-  
+  current_trx = NULL;
   get_or_create_trx(thd, current_trx);
+  assert(current_trx != NULL);
   if(lock_type == F_WRLCK) {
     current_trx->for_update = true;
   } else {
@@ -2931,7 +2933,7 @@ int ha_warp::get_or_create_trx(THD* thd, warp_trx* &trx) {
     thd->get_ha_data(warp_hton->slot)->ha_ptr = (void*)trx;
     trx->thd = thd;
     trx->hton = warp_hton;
-    current_trx = trx;
+    //current_trx = trx;
     trx->begin();
     // each statement writes a transaction log
     trx->open_log();
@@ -3280,6 +3282,7 @@ bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
 // checks the transaction marker to see if if this
 // row is visible
 bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
+  
   if(current_trx == NULL) {
     get_or_create_trx(table->in_use, current_trx);
   }
@@ -3288,7 +3291,6 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
     last_trx_id = row_trx_id;
     if(current_trx->trx_id == row_trx_id || row_trx_id == 0) {
       is_visible = true;
-      return is_visible;
     } else {
       if(row_trx_id < current_trx->trx_id) {
         // row_trx_id is older!
@@ -3310,7 +3312,15 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
         }
       }
     }
+    /*
+    dbug("is_trx_visible_to_read: trx_id: " + std::to_string(current_trx->trx_id) + 
+         " last_trx_id: " + std::to_string(last_trx_id) + 
+         " row_trx_id:" + std::to_string(row_trx_id) +
+         " is_visible: " + std::to_string(is_visible)
+    );*/
   } 
+  
+
   return is_visible;
 }
 
