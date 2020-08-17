@@ -22,56 +22,55 @@
 #ifndef HA_WARP_HDR
 #define HA_WARP_HDR
 #define MYSQL_SERVER 1
-#include "sql/sql_class.h"
-#include "sql/sql_lex.h"
-#include "sql/item.h"
-#include "sql/item_cmpfunc.h"
 
+// system includes
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <string.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <fstream>  
+#include <iostream>  
+#include <string> 
+#include <thread>
+#include <forward_list>
+#include <unordered_map>
+#include <time.h>
 
+// MySQL utility includes
 #include "my_dir.h"
 #include "my_inttypes.h"
 #include "my_io.h"
-#include "sql/handler.h"
-#include "sql_string.h"
-#include "sql/dd/dd.h"
-#include "sql/dd/dd_table.h"
-#include "sql/dd/dd_schema.h"
-#include "sql/abstract_query_plan.h"
-
-#include <fcntl.h>
-#include <mysql/plugin.h>
-#include <mysql/psi/mysql_file.h>
-#include <algorithm>
-
 #include "map_helpers.h"
 #include "my_byteorder.h"
 #include "my_dbug.h"
 #include "my_psi_config.h"
 #include "mysql/plugin.h"
 #include "mysql/psi/mysql_memory.h"
+#include <mysql/plugin.h>
+#include <mysql/psi/mysql_file.h>
+#include "template_utils.h"
+
+// MySQL SQL includes
+#include "sql/sql_class.h"
+#include "sql/sql_lex.h"
+#include "sql/item.h"
+#include "sql/item_cmpfunc.h"
+#include "sql/handler.h"
+#include "sql_string.h"
+#include "sql/dd/dd.h"
+#include "sql/dd/dd_table.h"
+#include "sql/dd/dd_schema.h"
+#include "sql/abstract_query_plan.h"
 #include "sql/field.h"
 #include "sql/sql_class.h"
 #include "sql/system_variables.h"
 #include "sql/table.h"
-#include "template_utils.h"
-
 #include "sql/log.h"
+#include "sql/sql_thd_internal_api.h"
 
-
-#include <fstream>  
-#include <iostream>  
-#include <string> 
-#include <atomic>
-#include <vector>
-#include <thread>
-#include <forward_list>
-#include <unordered_map>
-#include <time.h>
-
+// Fastbit includes
 #include "include/fastbit/ibis.h"
 #include "include/fastbit/query.h"
 #include "include/fastbit/bundle.h"
@@ -80,10 +79,11 @@
 #include "include/fastbit/mensa.h"
 #include "include/fastbit/resource.h"
 #include "include/fastbit/util.h"
+#include "include/fastbit/qExpr.h"
 
-#include "sql/sql_thd_internal_api.h"
-
+// WARP includes
 #include "sparse.hpp"
+
 // used for debugging in development
 #define dbug(x) std::cerr << __LINE__ << ": " << x << "\n"; fflush(stdout)
 
@@ -182,24 +182,84 @@ struct WARP_SHARE {
   THR_LOCK lock;
 };
 
-class warp_pushdown_information {
- public:
- std::unordered_map<std::string, std::string> filters;
- std::unordered_map<std::string, std::string> alias_map;
- std::unordered_map<std::string, Field **> fields;
- // the table might be opened in engine_pushdown() for
- // pushdown join optimization - if so, when the
- // table is iterated over these pointers will be
- // used instead of opening the table again.  This
- // information is set during condition pushdown
- // and persisted on the table handle after it completes
- // and then the pointers are set to NULL
- ibis::mensa* base_table;
- ibis::table* filtered_table;
+class warp_join_info {
+  public:
+  const char* alias;
+  Field* field;
 };
 
+// This class is filled out during ::info and ::engine_pushdown 
+class warp_pushdown_information {
+  public:
+  bool is_fact_table = false;
+  
+  // columns projected from this table
+  // if the table is opened during pushdown operations, these
+  // columns will be projected so that the opened and filtered
+  // table can be re-used for the scan
+  std::string column_set = "";
+
+  // where clause set in ::cond_push
+  std::string filter;
+  
+  // data directory of the table
+  const char* datadir;
+  
+  // fields of the table
+  Field** fields;
+
+  // number of rows in the table (may be adjusted down for star schema optimization)
+  uint64_t rowcount = 0;
+
+  // fastbit objects for iterating the filtered table (may be opened in ::cond_push)
+  ibis::table* base_table;
+  ibis::table* filtered_table;
+  ibis::table::cursor* cursor;
+  
+  // This points to a field on a specific table
+  // in the join.  It is used to project the join
+  // field information on this when the fact table is
+  // opened, and to construct an in-memory hash
+  // index if there is key on the dimension table
+  std::unordered_map<Field*, warp_join_info> join_info;
+
+  // if an index exists for the join in the dimension
+  // table, then an in memory has index will be built
+  // on the table to improve join performance because
+  // point lookups on a bitmap index are much slower
+  // than a tree index
+  bool build_hash_index = false;
+  
+  // in memory hash indexes
+  // these map lookup values like P_PartKey = 32 to the 
+  // row in the filtered_table cursor
+  std::unordered_multimap<std::string, uint64_t> string_to_row_map;
+  std::unordered_multimap<uint64_t, uint64_t> uint_to_row_map;
+  std::unordered_multimap<int64_t, uint64_t> int_to_row_map;
+  std::unordered_multimap<double, uint64_t> double_to_row_map;
+
+  // free up the fastbit resources once the table is finshed
+  // being used
+  ~warp_pushdown_information() {
+    delete cursor;
+    cursor = NULL;
+    delete filtered_table;
+    filtered_table = NULL;
+    delete base_table;
+    base_table = NULL;
+  }
+
+};
+
+// maps the table aliases for this query to pushdown information info
+std::unordered_map<THD*, std::unordered_map<const char*, warp_pushdown_information*> * > pd_info;
+// held when accessing or modifying the pushdown info
 std::mutex pushdown_mtx;
-std::unordered_map<THD*, warp_pushdown_information*> pd_info;
+
+// initializes or returns the pushdown information for a table used in a query
+warp_pushdown_information* get_or_create_pushdown_info(THD* thd, const char* alias, const char* data_dir_name);
+warp_pushdown_information* get_pushdown_info(THD* thd, const char* alias);
+
 
 // used as a type of lock to provide consistent snapshots
 // to deleted rows not visible to older transactions
@@ -456,6 +516,9 @@ int warp_upgrade_tables(uint16_t version);
 // and for REPEATABLE READ during scans
 bool warp_is_trx_open(uint64_t trx_id);
 
+std::unordered_map<const char*, uint64_t> get_table_counts_in_schema(char* table_dir);
+const char* get_table_with_most_rows(std::unordered_map<const char*, uint64_t>* table_counts);
+
 //warp_trx* warp_get_trx(handlerton* hton, THD* thd);
 
 //This is the handler where the majority of the work is done.  Handles
@@ -485,7 +548,7 @@ class ha_warp : public handler {
   static int get_writer_partno(ibis::tablex* writer, char* datadir);
   static void background_write(ibis::tablex* writer,  char* datadir, TABLE* table, WARP_SHARE* share);
   void foreground_write();
-  bool append_column_filter(const Item* cond, std::string& push_where_clause); 
+  int append_column_filter(const Item* cond, std::string& push_where_clause); 
   static void maintain_indexes(char* datadir, TABLE* table);
   void open_deleted_bitmap(int lock_mode = LOCK_SH);
   void close_deleted_bitmap();
@@ -500,14 +563,16 @@ class ha_warp : public handler {
   String key_part_esc;
   bool has_unique_keys();
   void make_unique_check_clause();
-
-  warp_pushdown_information* pushdown_info = NULL;
-  bool table_opened_in_pushdown = false;
-
+  //int bitmap_merge_join(Field* join_field, const char* dim_data_directory, warp_join_information dim_info);
+  int bitmap_merge_join();
+  uint64_t lookup_in_hash_index(const uchar*, key_part_map, ha_rkey_function);
+  void cleanup_pushdown_info();
   //std::mutex thd_lock;
 
+  bool close_in_extra = false;
+
   /* These objects are used to access the FastBit tables for tuple reads.*/ 
-  ibis::mensa*         base_table         = NULL; 
+  ibis::table*         base_table         = NULL; 
   ibis::table*         filtered_table     = NULL;
   ibis::table*         idx_filtered_table = NULL;
   ibis::table::cursor* cursor             = NULL;
@@ -522,7 +587,10 @@ class ha_warp : public handler {
 
   /* WHERE clause constructed from engine condition pushdown */
   std::string          push_where_clause  = "";
-
+  
+  // used for index lookups
+  std::string          idx_where_clause   = "";
+  ibis::qExpr*         idx_qexpr;
   /* This object is used to append tuples to the table */
   ibis::tablex* writer = NULL;
 
@@ -534,7 +602,7 @@ class ha_warp : public handler {
 
   /* a SELECT lists of the columns that have been fetched for the current query */
   std::string column_set = "";
-  std::string index_column_set = "";
+  //std::string index_column_set = "";
 
   /* temporary buffer populated with CSV of row for insertions*/
   String buffer;
@@ -549,14 +617,14 @@ class ha_warp : public handler {
   ha_warp(handlerton *hton, TABLE_SHARE *table_arg);
   handlerton* warp_hton;
   ~ha_warp() {
-    //free_root(&blobroot, MYF(0));
+    free_root(&blobroot, MYF(0));
   }
  
   const char *table_type() const { return "WARP"; }
  
   ulonglong table_flags() const {
     // return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE | HA_CAN_REPAIR);
-    return (HA_BINLOG_ROW_CAPABLE | HA_CAN_REPAIR);
+    return (HA_BINLOG_ROW_CAPABLE | HA_NO_AUTO_INCREMENT | HA_CAN_REPAIR);
   }
  
   uint max_record_length() const { return HA_MAX_REC_LENGTH; }
@@ -626,9 +694,13 @@ class ha_warp : public handler {
   */
   void get_status();
   void update_status();
-
+  ulong index_flags(uint, uint, bool) const {
+    return 0;
+  };
+  
   // Functions to support indexing
-  ulong index_flags(uint, uint, bool) const;
+  /*
+  
   ha_rows records_in_range(uint idxno, key_range *, key_range *); 
   int index_init(uint idxno, bool sorted);
   int index_init(uint idxno);
@@ -637,7 +709,7 @@ class ha_warp : public handler {
   int index_end();
   int index_read_map (uchar *buf, const uchar *key, key_part_map keypart_map, enum ha_rkey_function find_flag);
   int index_read_idx_map (uchar *buf, uint idxno, const uchar *key, key_part_map keypart_map, enum ha_rkey_function find_flag);
-  int make_where_clause(const uchar *key, key_part_map keypart_map, enum ha_rkey_function find_flag, std::string& where_clause);
+  int make_where_clause(const uchar *key, key_part_map keypart_map, enum ha_rkey_function find_flag);
   void get_auto_increment	(	
     ulonglong 	offset,
     ulonglong 	increment,
@@ -645,12 +717,15 @@ class ha_warp : public handler {
     ulonglong * 	first_value,
     ulonglong * 	nb_reserved_values 
   );
+  */
 
   // Functions to support engine condition pushdown (ECP)
   int engine_push(AQP::Table_access *table_aqp);
   const Item* cond_push(const Item *cond,	bool other_tbls_ok );
 	
   int rename_table(const char * from, const char * to, const dd::Table* , dd::Table* );
-  
+
+  std::string explain_extra() const;
+
 };
 #endif
