@@ -172,6 +172,7 @@ SYS_VAR* system_variables[] = {
   NULL
 };
 
+std::mutex write_mutex;
 
 struct WARP_SHARE {
   std::string table_name;
@@ -238,9 +239,12 @@ class warp_pushdown_information {
 
   // free up the fastbit resources once the table is finshed
   // being used
+  
   ~warp_pushdown_information() {
-    delete cursor;
-    cursor = NULL;
+    if(cursor != NULL) {
+      delete cursor;
+    }
+    if(filtered_table != NULL)
     delete filtered_table;
     filtered_table = NULL;
     delete base_table;
@@ -295,6 +299,7 @@ class warp_lock {
   int lock_type = 0;
 };
 
+
 // markers for the transaction logs
 const char begin_marker     = 1;
 const char insert_marker    = 2;
@@ -304,7 +309,7 @@ const char rollback_marker  = 5;
 const char savepoint_marker = 6;
 #define ROLLBACK_STATEMENT 0
 
-  
+std::mutex trx_mutex;  
 //Holds the state of a WARP transaction.  Instantiated in ::external_lock
 //or ::start_stmt
 class warp_trx {
@@ -342,10 +347,7 @@ class warp_trx {
   //number of background writers that are doing work.  The commit
   //function must wait for this counter to reach zero before a 
   //transaction can be committed
-  uint64_t background_writer_count = 0;
-
-  THD* thd = NULL;
-  handlerton* hton; 
+  //uint64_t background_writer_count = 0;
 
   //the transaction was not a read-only transaction and it 
   //modified rows in the database, so it must be writen into
@@ -395,8 +397,7 @@ class warp_global_data {
   // Each time a transaction is handed out, this is pre-incremented
   // and the value is used for the tranaction identifier.  When the
   // transaction is committed, this idenifier is written into the
-  // commit bitmap once all the background writers associated with
-  // the transaction complete writing.
+  // commit bitmap.
   ulonglong next_trx_id = 1;
 
   // Each time a write into a table starts, WARP hands out 
@@ -517,7 +518,7 @@ bool warp_is_trx_open(uint64_t trx_id);
 std::unordered_map<const char*, uint64_t> get_table_counts_in_schema(char* table_dir);
 const char* get_table_with_most_rows(std::unordered_map<const char*, uint64_t>* table_counts);
 
-//warp_trx* warp_get_trx(handlerton* hton, THD* thd);
+warp_trx* warp_get_trx(handlerton* hton, THD* thd);
 
 //This is the handler where the majority of the work is done.  Handles
 //creating and dropping tables, TRUNCATE table, reading from indexes,
@@ -532,7 +533,7 @@ class ha_warp : public handler {
  /* used in visibility checks */
  uint64_t last_trx_id = 0;
  bool is_visible = false;
- warp_trx* current_trx = NULL;
+ //warp_trx* current_trx = NULL;
 
 
  private:
@@ -543,8 +544,8 @@ class ha_warp : public handler {
   //int set_column_set(uint32_t idxno);
   int find_current_row(uchar *buf, ibis::table::cursor* cursor);
   void create_writer(TABLE *table_arg);
-  static int get_writer_partno(ibis::tablex* writer, char* datadir);
-  static void background_write(ibis::tablex* writer,  char* datadir, TABLE* table, WARP_SHARE* share);
+  std::string get_writer_partition();
+  void write_buffered_rows_to_disk();
   void foreground_write();
   int append_column_filter(const Item* cond, std::string& push_where_clause); 
   static void maintain_indexes(char* datadir, TABLE* table);
@@ -609,7 +610,7 @@ class ha_warp : public handler {
 
   /* set to true if the table has deleted rows */
   bool has_deleted_rows = false;
-
+  
  public:
   ha_warp(handlerton *hton, TABLE_SHARE *table_arg);
   handlerton* warp_hton;
@@ -674,13 +675,14 @@ class ha_warp : public handler {
              dd::Table *table_def);
   bool check_if_incompatible_data(HA_CREATE_INFO *info, uint table_changes);
   int delete_table(const char *table_name, const dd::Table *);
-  int get_or_create_trx(THD* thd, warp_trx* &trx);
+  warp_trx* create_trx(THD* thd);
   int external_lock(THD *thd, int lock_type);
   int start_stmt(THD *thd, thr_lock_type lock_type);
   int register_trx_with_mysql(THD* thd, warp_trx* trx);
   bool is_trx_visible_to_read(uint64_t row_trx_id);
   bool is_row_visible_to_read(uint64_t rowid);
-  
+  void start_bulk_insert(ha_rows rows);
+  int end_bulk_insert();
   //int truncate(dd::Table *);
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);

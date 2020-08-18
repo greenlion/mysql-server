@@ -349,8 +349,7 @@ int ha_warp::encode_quote(uchar *) {
   buffer.append(std::to_string(current_rowid).c_str());
     
   /* add the transaction identifier */
-  current_trx=NULL;
-  get_or_create_trx(table->in_use, current_trx);
+  auto current_trx=warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
   buffer.append(",");
   buffer.append(std::to_string(current_trx->trx_id).c_str());
@@ -800,57 +799,65 @@ int ha_warp::close(void) {
   DBUG_RETURN(free_share(share));
 }
 
-int ha_warp::get_writer_partno(ibis::tablex* writer, char* datadir) {
+void ha_warp::start_bulk_insert(ha_rows) {
+}
+
+int ha_warp::end_bulk_insert() {
+  if(writer != NULL) {
+    /* foreground write actually because it is not executed in a different `thread */
+    write_buffered_rows_to_disk();
+  }
+  return 0;
+}
+
+std::string ha_warp::get_writer_partition() {
   ibis::partList parts;
-  int partition_count = ibis::util::gatherParts(parts, datadir);
+  int partition_count = ibis::util::gatherParts(parts, share->data_dir_name);
 
   /* The fastbit table name has to be the same as the partition number
      which is the directory name of the partition
   */
-  ibis::part *found = NULL;
-  int partno = 0;
-  if(partition_count > 1) {
-    /* skip the first partition, which is just for metadata and is always empty
-     */
-    for (auto it = parts.begin() + 1; it < parts.end(); ++it, ++partno) {
-      auto part = *it;
-      if(part->nRows() + writer->mRows() <= my_partition_max_rows) {
-        found = part;
-        break;
-      }
-    }
-  }
-  /* If the table is empty, then partno will be zero and found will be NULL.
-     Otherwise, if found != NULL and partno <= partition_count then a partition
-     is fouund that will fit all the new rows.
-  */
-  if(found == NULL) {
-    partno = partition_count - 1;
-  }
-  return partno;
-}
-/* write the rows in the background and destroy the writer*/
-void ha_warp::background_write(ibis::tablex *writer, char *datadir,
-                               TABLE *table, 
-                               WARP_SHARE *share) {
   
-  mysql_mutex_lock(&share->mutex);
-  auto partno = ha_warp::get_writer_partno(writer, datadir);
-  std::string part_dir = "";
-  std::string part_name = "";
-  part_dir = std::string(datadir) + "/p" + std::to_string(partno);
-  part_name = "p" + std::to_string(partno);
-  writer->write(part_dir.c_str(), part_name.c_str());
-  writer->clearData();
+  ibis::part* least_part=NULL;
+  uint64_t least_cnt = -1ULL;
 
+  if(partition_count == 1) {
+    return std::string(share->data_dir_name) + std::string("/p0");
+  }
+  
+  for (auto it = parts.begin() + 1; it < parts.end(); ++it) {
+    if(least_cnt > (*it)->nRows()) {
+      least_part = *it;
+      least_cnt = (*it)->nRows();
+    }
+  }   
+  if(least_cnt + writer->mRows() <= my_partition_max_rows) {
+    return std::string(least_part->currentDataDir());
+  }
+ 
+  return std::string(share->data_dir_name) + std::string("/p") + std::to_string(parts.size());
+}
+
+/* write the rows and destroy the writer*/
+void ha_warp::write_buffered_rows_to_disk() {
+  mysql_mutex_lock(&share->mutex);
+  std::string part_dir = get_writer_partition();
+  auto part_dir_copy = strdup(part_dir.c_str());
+  auto part_name = basename(part_dir_copy);
+  
+  writer->write(part_dir.c_str(), part_name);
+  free(part_dir_copy);
+  writer->clearData();
   delete writer;
+  writer = NULL;
 
   /* rebuild any indexed columns */
-  maintain_indexes(datadir, table);
+  maintain_indexes(share->data_dir_name, table);
   mysql_mutex_unlock(&share->mutex);
 };
 
 /* write the rows in the background and destroy the writer*/
+/*
 void ha_warp::foreground_write() {
   auto partno = ha_warp::get_writer_partno(writer, share->data_dir_name);
   std::string part_dir = "";
@@ -863,7 +870,7 @@ void ha_warp::foreground_write() {
   delete writer;
   writer = NULL;
   maintain_indexes(share->data_dir_name, table);
-};
+};*/
 
 /*
 bool ha_warp::has_unique_keys() {
@@ -973,17 +980,15 @@ int ha_warp::write_row(uchar *buf) {
     share->next_rowid = warp_state->get_next_rowid_batch();
   } 
   current_rowid = share->next_rowid--;
+  
   mysql_mutex_unlock(&share->mutex);
-  current_trx = NULL;
-  if(current_trx == NULL) {
-    get_or_create_trx(table->in_use, current_trx);
-  }
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
   
   /* check for duplicate key values */
   int errcode = 0;
-  last_trx_id = 0;
-  uint64_t row_trx_id;
+  //last_trx_id = 0;
+  //uint64_t row_trx_id;
   
   // this function uses the table->field object to access the data
   // in the row buffer!
@@ -1118,16 +1123,8 @@ int ha_warp::write_row(uchar *buf) {
   } else
   */
   if(writer->mRows() >= my_write_cache_size) {
-    // spawn the background writer if the cache size is exceeded.
-    ibis::tablex *writing_writer = writer;
-    writer = NULL;
-    // Spawn a background thread using a static method ha_warp::background_write
-    std::thread writer_thread(ha_warp::background_write, writing_writer,
-                              share->data_dir_name, table, share);
-
-    /* Don't worry about reaping the thread.  It will complete work and then exit.
-    */
-    writer_thread.detach();
+    // write the rows to disk and destroy the writer (a new one will be created)
+    write_buffered_rows_to_disk();
   }
   DBUG_RETURN(0);
 }
@@ -1143,6 +1140,8 @@ int ha_warp::write_row(uchar *buf) {
 int ha_warp::update_row(const uchar *, uchar *new_data) {
   
   DBUG_ENTER("ha_warp::update_row");
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  assert(current_trx != NULL);
   int lock_taken = warp_state->create_lock(current_rowid, current_trx, WRITE_INTENTION);
   /* if deadlock or lock timeout return the error*/
   if(lock_taken != LOCK_EX) {
@@ -1180,6 +1179,8 @@ int ha_warp::update_row(const uchar *, uchar *new_data) {
 */
 int ha_warp::delete_row(const uchar *) {
   DBUG_ENTER("ha_warp::delete_row");
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  assert(current_trx != NULL);
   int lock_taken = warp_state->create_lock(current_rowid, current_trx, LOCK_EX);
   /* if deadlock or lock timeout return the error*/
   if(lock_taken != LOCK_EX) {
@@ -1226,11 +1227,16 @@ int ha_warp::info(uint) {
   const char* table_with_most_rows = get_table_with_most_rows(&table_counts);
   assert(table_with_most_rows != NULL);
   bool is_fact_table = false;
+
   // if this is the fact table (largest table in schema) set the records to the smallest possible value
   // which is 2 (otherwise const evaluation will be used)
-  if(std::string(share->data_dir_name) == std::string(table_with_most_rows)) {
-    is_fact_table = true;
-    stats.records = 2;
+  if(table_with_most_rows != NULL) {
+    if(std::string(share->data_dir_name) == std::string(table_with_most_rows)) {
+      is_fact_table = true;
+      stats.records = 2;
+    }
+  } else {
+    stats.records = 0;
   }
   
   stats.mean_rec_length = 0;
@@ -1301,10 +1307,13 @@ int ha_warp::info(uint) {
   warp_pushdown_information* pushdown_info = get_or_create_pushdown_info(table->in_use, table->alias, share->data_dir_name);
   pushdown_info->fields = table->s->field;
   set_column_set();
+
   pushdown_info->column_set = column_set;
+
   if(is_fact_table) {
     pushdown_info->is_fact_table = true;
   }
+
   DBUG_RETURN(0);
 }
 
@@ -1339,11 +1348,6 @@ void ha_warp::maintain_indexes(char *datadir, TABLE *table) {
    work.
 */
 int ha_warp::extra(enum ha_extra_function) {
-  if(writer != NULL && writer->mRows() > 0) {
-    /* foreground write actually because it is not executed in a different `thread */
-    background_write(writer, share->data_dir_name, table, share);
-    writer = NULL;
-  }
   return 0;
 }
 
@@ -1386,9 +1390,9 @@ int ha_warp::repair(THD *, HA_CHECK_OPT *) {
 THR_LOCK_DATA **ha_warp::store_lock(THD *, THR_LOCK_DATA **to,
                                     enum thr_lock_type lock_type) {
   DBUG_ENTER("ha_warp::store_lock");
-  if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
+  /*if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
     lock.type = lock_type;
-  }
+  }*/
 
   *to++ = &lock;
   DBUG_RETURN(to);
@@ -1656,7 +1660,6 @@ int ha_warp::rnd_init(bool) {
      that have already been evaluated
   */  
   last_trx_id = 0;
-  current_trx = NULL;
 
   /* This is the a big part of the performance advantage of WARP outside of
      the bitmap indexes.  This figures out which columns this query is reading
@@ -1822,6 +1825,11 @@ int ha_warp::rnd_end() {
   DBUG_ENTER("ha_warp::rnd_end");
   blobroot.Clear();
   push_where_clause = "";
+  /*
+  delete base_table;
+  delete cursor;
+  delete filtered_table;
+  */
   base_table = NULL;
   filtered_table = NULL;
   cursor = NULL;
@@ -2619,15 +2627,17 @@ int ha_warp::append_column_filter(const Item *cond,
       and fact.dim_id IN(10,15,20);  
 */
 int ha_warp::bitmap_merge_join() {
-  
   auto fact_pushdown_info=get_pushdown_info(table->in_use, table->alias);
-  
+  if(fact_pushdown_info == NULL) {
+    return 0;
+  }
+
   std::string fact_pushdown_clause = "";
   std::string dim_pushdown_clause = "";
   if(fact_pushdown_info->filter != "") {
     fact_pushdown_clause = fact_pushdown_info->filter;
   }
-  
+
   for(auto join_it = fact_pushdown_info->join_info.begin(); join_it != fact_pushdown_info->join_info.end(); ++join_it) {
     //bool dim_full_table_scan = false;
     Field* fact_field = join_it->first;
@@ -2640,18 +2650,20 @@ int ha_warp::bitmap_merge_join() {
        fact_field->real_type() ==  MYSQL_TYPE_JSON) {
       continue;
     }
-  
+
     Field* dim_field = join_it->second.field;
     auto dim_pushdown_info = get_pushdown_info(table->in_use, join_it->second.alias);
-    
+    if(dim_pushdown_info == NULL) {
+      continue;
+    }
+
     std::string fact_colname = std::string("c") + std::to_string(fact_field->field_index());
     std::string fact_nullname = std::string("n") + std::to_string(fact_field->field_index());
     std::string dim_colname = std::string("c") + std::to_string(dim_field->field_index());
     std::string dim_nullname = std::string("n") + std::to_string(dim_field->field_index());
     bool fact_is_nullable = fact_field->is_nullable();
     bool dim_is_nullable = dim_field->is_nullable();
-  
-    
+
     if(dim_pushdown_info->filter == "") {
       continue;
     } 
@@ -2675,16 +2687,22 @@ int ha_warp::bitmap_merge_join() {
     /* open the dimension table to read the data - the pointers are stored on the pushdown
         info structure so that they can be re-used in the scan
     */
-   
     dim_pushdown_info->base_table = ibis::mensa::create(dim_pushdown_info->datadir);
-    assert(dim_pushdown_info->base_table != NULL);
+
+    if(dim_pushdown_info->base_table == NULL) {
+      continue;
+    }
     
     dim_pushdown_info->filtered_table = 
     dim_pushdown_info->base_table->select(dim_pushdown_info->column_set.c_str(), dim_pushdown_clause.c_str());
     
-    assert(dim_pushdown_info->filtered_table != NULL);
-    
+    if(dim_pushdown_info->filtered_table == NULL) {
+      continue;
+    }
     auto dim_cursor = dim_pushdown_info->filtered_table->createCursor();      
+    if(dim_cursor == NULL) {
+      continue;
+    }
     bool first_row = true;
     /*
     std::vector<uint64_t> uints;
@@ -2833,6 +2851,7 @@ int ha_warp::bitmap_merge_join() {
     // new cursor will be opened in the scan if it wasn't used to build
     // a hash index otherwise attach this cursor to make sure the 
     // positional information remains vali
+    delete dim_cursor;
     dim_pushdown_info->cursor = NULL;
     fact_pushdown_clause += ")";
   } // end of dim tables loop   
@@ -2893,73 +2912,62 @@ int ha_warp::register_trx_with_mysql(THD* thd, warp_trx* trx) {
 }
 
 int ha_warp::external_lock(THD *thd, int lock_type){ 
-  //int trx_state = 0;
-  int retval = 0;
-  current_trx = NULL;
-  get_or_create_trx(thd, current_trx);
-  assert(current_trx != NULL);
-  if(lock_type == F_WRLCK) {
-    current_trx->for_update = true;
-  } else {
-    current_trx->for_update = false;
-  }
-
-  /* serializable isolation level takes shared locks on all visible rows traveresed
-     and so does LOCK IN SHARE MODE
-  */
-  if (lock_type == F_RDLCK || current_trx->isolation_level == ISO_SERIALIZABLE) {
-    current_trx->lock_in_share_mode=true;
-  }
 
   if (lock_type != F_UNLCK)  {
+    auto current_trx = warp_get_trx(warp_hton, table->in_use);
+    if(current_trx == NULL) current_trx = create_trx(table->in_use);
+    assert(current_trx != NULL);
+  
     register_trx_with_mysql(thd, current_trx);
     current_trx->lock_count++;
+
+    if(lock_type == F_WRLCK) {
+      current_trx->for_update = true;
+    } else {
+      current_trx->for_update = false;
+    }
+
+    /* serializable isolation level takes shared locks on all visible rows traveresed
+      and so does LOCK IN SHARE MODE
+    */
+    current_trx->lock_in_share_mode = false;
+    if (lock_type == F_RDLCK || current_trx->isolation_level == ISO_SERIALIZABLE) {
+      current_trx->lock_in_share_mode=true;
+    }
+    enum_sql_command sql_command = (enum_sql_command)thd_sql_command(thd);
+    if(sql_command == SQLCOM_UPDATE || 
+      sql_command == SQLCOM_INSERT ||
+      sql_command == SQLCOM_REPLACE ||
+      sql_command == SQLCOM_DELETE ||
+      sql_command == SQLCOM_INSERT_SELECT ||
+      sql_command == SQLCOM_LOAD)  {  // the first time a data modification statement is encountered
+      // the transaction is marked dirty.  Registering the open
+      // transaction prevents a transaction from seeing inserts
+      // that are not visible to it and to still find duplicate
+      // keys in transactions doing concurrent inserts
+      if(!current_trx->dirty) {
+        warp_state->register_open_trx(current_trx->trx_id);
+        current_trx->dirty = true;
+      }
+    } 
   } else {
-      current_trx->lock_count--;  
-      cleanup_pushdown_info();
-      /*if(trx->lock_count != 0) {
-        register_trx_with_mysql(thd, current_trx);
-      } */     
+    // unlock the table
+    cleanup_pushdown_info();
   }
 
-  return retval;
+  return 0;
 }
 
-int ha_warp::get_or_create_trx(THD* thd, warp_trx* &trx) {
-  trx = (warp_trx*)thd->get_ha_data(warp_hton->slot)->ha_ptr;
-  if(trx == NULL) {
-    trx = new warp_trx;
-    trx->isolation_level = thd_get_trx_isolation(thd);
-    thd->get_ha_data(warp_hton->slot)->ha_ptr = (void*)trx;
-    trx->thd = thd;
-    trx->hton = warp_hton;
-    //current_trx = trx;
-    trx->begin();
-    // each statement writes a transaction log
-    trx->open_log();
-  }
+warp_trx* ha_warp::create_trx(THD* thd) {
+  trx_mutex.lock();
+  auto trx = new warp_trx;
+  trx->isolation_level = thd_get_trx_isolation(thd);
+  thd->get_ha_data(warp_hton->slot)->ha_ptr = (void*)trx;
+  trx->begin();
+  trx->open_log();
   trx->autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK);
-  enum_sql_command sql_command = (enum_sql_command)thd_sql_command(thd);
-  if(sql_command == SQLCOM_UPDATE || 
-     sql_command == SQLCOM_INSERT ||
-     sql_command == SQLCOM_REPLACE ||
-     sql_command == SQLCOM_DELETE ||
-     sql_command == SQLCOM_INSERT_SELECT ||
-     sql_command == SQLCOM_LOAD)  
-  {  // the first time a data modification statement is encountered
-     // the transaction is marked dirty.  Registering the open
-     // transaction prevents a transaction from seeing inserts
-     // that are not visible to it and to still find duplicate
-     // keys in transactions doing concurrent inserts
-     if(!trx->dirty) {
-       warp_state->register_open_trx(trx->trx_id);
-       trx->dirty = true;
-     }
-
-  }  
-
-  
-  return 0;
+  trx_mutex.unlock();
+  return trx;
 }
 
 void warp_trx::open_log() {
@@ -3019,7 +3027,6 @@ void warp_trx::commit() {
   int sz = 0;
   uint64_t rowid = 0;
   char marker;
-  
   if(dirty) {
     // if(log == NULL || ftell(log) == 0) {
     //   if(log) fclose(log);
@@ -3080,7 +3087,7 @@ done:
       sql_print_error("Failed to commit delete bitmap %s", warp_state->delete_bitmap->get_fname().c_str());
       assert(false);
     }
-    warp_state->delete_bitmap->close(1);
+    //warp_state->delete_bitmap->close(1);
     
     // mark the transaction committed
     if(warp_state->commit_bitmap->set_bit(trx_id) != 0) {
@@ -3091,11 +3098,12 @@ done:
       sql_print_error("Failed to commit bits in commit bitmap %s", warp_state->commit_bitmap->get_fname().c_str());
       assert(false);
     }
-    warp_state->commit_bitmap->close(1);
+    //warp_state->commit_bitmap->close(1);
     fclose(log);
     unlink(log_filename.c_str());
     log = NULL;
   }
+  
   commit_mtx.unlock();
 }
 
@@ -3169,7 +3177,7 @@ done:
             assert(false);
           }
         }
-        warp_state->delete_bitmap->close(1);
+        //warp_state->delete_bitmap->close(1);
         // remove the savepoint data
         if(savepoint_at > 0) {
           ftruncate(fileno(log), savepoint_at);
@@ -3200,11 +3208,11 @@ warp_trx* warp_get_trx(handlerton* hton, THD* thd) {
    to do this work.
 */
 int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
-  warp_trx* trx = warp_get_trx(hton, thd);
-  if(commit_trx || trx->autocommit) {
-    if(trx->dirty) {
-       trx->commit();
-       warp_state->mark_transaction_closed(trx->trx_id);
+  auto current_trx = warp_get_trx(hton, thd);
+  if(commit_trx || current_trx->autocommit) {
+    if(current_trx->dirty) {
+       current_trx->commit();
+       warp_state->mark_transaction_closed(current_trx->trx_id);
     }
   } else {
       /* this transaction is not ready to be committed to the
@@ -3219,8 +3227,8 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
      the connection must be destroyed.
   */
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
-  warp_state->free_locks(trx);
-  delete trx;
+  warp_state->free_locks(current_trx);
+  delete current_trx;
   return 0;
 }
 
@@ -3263,6 +3271,8 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
 }
 bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
   uint64_t history_trx_id = warp_state->get_history_lock(rowid);
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  assert(current_trx != NULL);
   if(history_trx_id == 0 
     || history_trx_id < current_trx->trx_id 
     || (history_trx_id > current_trx->trx_id && current_trx->isolation_level != ISO_REPEATABLE_READ)) {
@@ -3283,11 +3293,13 @@ bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
 // row is visible
 bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
   
-  if(current_trx == NULL) {
-    get_or_create_trx(table->in_use, current_trx);
-  }
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
   if(last_trx_id != row_trx_id) {
+    /*dbug("is_trx_visible_to_read: trx_id: " + std::to_string(current_trx->trx_id) + 
+         " last_trx_id: " + std::to_string(last_trx_id) + 
+         " row_trx_id:" + std::to_string(row_trx_id) 
+    );*/
     last_trx_id = row_trx_id;
     if(current_trx->trx_id == row_trx_id || row_trx_id == 0) {
       is_visible = true;
@@ -3580,7 +3592,7 @@ int warp_global_data::create_lock(uint64_t rowid, warp_trx* trx, int lock_type) 
   sleep_time.tv_nsec = 100000000L; // sleep a millisecond
   // each sleep beyond the spin locks increments the 
   // waiting time
-  ulonglong max_wait_time = THDVAR(trx->thd, lock_wait_timeout);
+  ulonglong max_wait_time = THDVAR(current_thd, lock_wait_timeout);
   ulonglong wait_time = 0;
   // create a new lock for our lock
   // will be deleted and replaced if 
@@ -3969,7 +3981,10 @@ std::unordered_map<const char*, uint64_t> get_table_counts_in_schema(char* table
     // the top-level partition ends in .data, the other partitions are ./data/pXXX
     if(strstr(part->currentDataDir(), ".data/") == NULL) {
       ibis::table* tbl = ibis::mensa::create(part->currentDataDir());
-      assert(tbl != NULL);
+      if(!tbl) {
+        table_counts.emplace(part->currentDataDir(), 0);
+        continue;
+      }
       table_counts.emplace(part->currentDataDir(), tbl->nRows());
       delete tbl;
     }
@@ -3995,6 +4010,11 @@ warp_pushdown_information* get_pushdown_info(THD* thd, const char* alias) {
   pushdown_mtx.lock();
   // The pushdown information will be missing if the referenced table
   // belongs to a different storage engine
+  if(pd_info.empty()) { 
+    pushdown_mtx.unlock();
+    return NULL;
+  }
+
   auto it = pd_info.find(thd);
   if(it == pd_info.end()) {
     pushdown_mtx.unlock();
@@ -4004,13 +4024,36 @@ warp_pushdown_information* get_pushdown_info(THD* thd, const char* alias) {
   // If it was found above it is a WARP table and the map 
   // information should be set - if it is NULL then something is broken!
   auto pushdown_info_map = it->second;
-  assert(pushdown_info_map != NULL);
-
+  if(pushdown_info_map == NULL) {
+    pushdown_mtx.unlock();
+    return NULL;
+  }
+  
+  if(pushdown_info_map->empty()) { 
+    pushdown_mtx.unlock();
+    return NULL; 
+  }
+  
+  int is_empty = true;
+  for(auto it2 = pushdown_info_map->begin();it2!=pushdown_info_map->end(); ++it2) {
+    if(std::string(it2->first) == std::string(alias)) {
+      is_empty = false;
+      break;
+    }
+  }
+  if(is_empty) {
+    pushdown_mtx.unlock();
+    return NULL;
+  }
   auto it2 = pushdown_info_map->find(alias);
   assert(it2 != pushdown_info_map->end());
+    
+  if(it2->first == NULL) {
+    pushdown_mtx.unlock();
+    return NULL;
+  }
   
   pushdown_mtx.unlock();
-  
   // return the pushdown info
   return it2->second;
 }

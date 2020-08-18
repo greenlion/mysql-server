@@ -43,6 +43,7 @@ private:
   int dirty=0;
   int have_lock=LOCK_UN;
   unsigned long long fpos = 0;
+  std::mutex set_bit_mtx;
 
 public:
   bool is_dirty() {
@@ -356,10 +357,7 @@ public:
   /* sync the changes to disk, first the log
    * and then the data file */
   int commit() {
-    //bitmap_dbug("commit");
     if(dirty) {
-      //bitmap_dbug("bitmap is dirty - writing commit marker");
-      //bitmap_dbug(fname.c_str());
       int zero=0;
       int sz = fwrite(&zero, BLOCK_SIZE, 1, log);
       fsync(fileno(log));
@@ -379,23 +377,31 @@ public:
 
   /* check to see if a particular bit is set */
   inline int is_set(unsigned long long bitnum) {
+    
     assert(bitnum > 0);
     //bitmap_dbug("is_set: bit " + std::to_string(bitnum));
     if(!fp) open(fname, LOCK_SH);
     lock(LOCK_SH);
     
     int bit_offset;
+    set_bit_mtx.lock();
     unsigned long long at_byte = (bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1;
     if(at_byte != fpos) {
+      
       fseek(fp, at_byte, SEEK_SET);
       fpos = at_byte;
       size_t sz = fread(&bits, BLOCK_SIZE, 1, fp);
-      
-      if(sz == 0 || feof(fp)) { 
+      fseek(fp, at_byte, SEEK_SET); 
+      if(sz == 0) { 
+        bits = 0;
+        set_bit_mtx.unlock();
         return 0;
       }
+    
     }
+    set_bit_mtx.unlock();
     int retval = (bits >> bit_offset) & 1; 
+    
     return retval ;
   }
 
@@ -406,14 +412,14 @@ public:
   inline int set_bit(unsigned long long bitnum, int mode = MODE_SET) {
     //bitmap_dbug("set_bit");
     assert(bitnum > 0);
-    if(!fp || have_lock != LOCK_EX) open(fname, LOCK_EX);
-      
-    /*
-    bool force_read = false;
-    if(dirty == 0) {
-      force_read = true;
-    } 
-    */
+    if (fp) clearerr(fp);
+    set_bit_mtx.lock();
+ 
+    if(!fp || have_lock != LOCK_EX) {
+      open(fname, LOCK_EX);
+    } else {
+      if(lock_type != LOCK_EX) lock(LOCK_EX);  
+    }
     dirty = 1;
     // write-ahead-log (only write when not in recovery mode) 
     // sz2 will be <1 on write error
@@ -421,11 +427,12 @@ public:
     if(!recovering) {
       uint64_t log_bitnum = bitnum;
       sz = fwrite(&log_bitnum, BLOCK_SIZE, 1, log);
-      if(sz != 1) return -1;
+      if(sz != 1) {
+        set_bit_mtx.unlock();
+        return -1;
+      }
     }
-
-    if(lock_type != LOCK_EX) lock(LOCK_EX);
-
+    
     /* which bit in the unsigned long long is to be set */
     int bit_offset;
 
@@ -437,7 +444,11 @@ public:
       fpos = at_byte;
       fseek(fp, at_byte, SEEK_SET);
       sz = fread(&bits, BLOCK_SIZE, 1, fp);
-      if(ferror(fp)) return -2;
+      if(ferror(fp)) {
+        set_bit_mtx.unlock();
+        return -2;
+      }
+      fseek(fp, at_byte, SEEK_SET); 
       if(sz == 0 || feof(fp)) bits = 0;
     }
     
@@ -450,10 +461,10 @@ public:
       fseek(fp, at_byte, SEEK_SET);
       fpos = at_byte;
     }
-
     sz = fwrite(&bits, BLOCK_SIZE, 1, fp);
     /* position back so that we don't read the block in again*/
     fseek(fp, at_byte, SEEK_SET); 
+    set_bit_mtx.unlock();
     return sz == 1 ? 0 : -2;
   }
 
