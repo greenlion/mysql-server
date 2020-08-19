@@ -3027,7 +3027,10 @@ void warp_trx::commit() {
   int sz = 0;
   uint64_t rowid = 0;
   char marker;
+  dbug("commiting " << trx_id << "to disk");
+  dbug("checking for dirty trx");
   if(dirty) {
+    dbug("trx is dirty");
     // if(log == NULL || ftell(log) == 0) {
     //   if(log) fclose(log);
     //   unlink(log_filename.c_str());
@@ -3090,14 +3093,23 @@ done:
     //warp_state->delete_bitmap->close(1);
     
     // mark the transaction committed
+    dbug("warp_trx::commit -> setting commit bit for:" << trx_id);
     if(warp_state->commit_bitmap->set_bit(trx_id) != 0) {
       sql_print_error("Failed to set bit in delete bitmap %s", warp_state->commit_bitmap->get_fname().c_str());
       assert(false);
     } 
+    
+    // fail if trx is not in the bitmap!
+    assert(warp_state->commit_bitmap->get_bit(trx_id));
+    
     if(warp_state->commit_bitmap->commit() != 0) {
       sql_print_error("Failed to commit bits in commit bitmap %s", warp_state->commit_bitmap->get_fname().c_str());
       assert(false);
     }
+    
+    // fail if trx is not in the bitmap!
+    assert(warp_state->commit_bitmap->get_bit(trx_id));
+    
     //warp_state->commit_bitmap->close(1);
     fclose(log);
     unlink(log_filename.c_str());
@@ -3209,8 +3221,10 @@ warp_trx* warp_get_trx(handlerton* hton, THD* thd) {
 */
 int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
   auto current_trx = warp_get_trx(hton, thd);
+  dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx));
   if(commit_trx || current_trx->autocommit) {
     if(current_trx->dirty) {
+       dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " calling commit!");
        current_trx->commit();
        warp_state->mark_transaction_closed(current_trx->trx_id);
     }
@@ -3226,6 +3240,7 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
      commited to disk, then the transaction information for
      the connection must be destroyed.
   */
+  dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " destroy trx.");
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
   warp_state->free_locks(current_trx);
   delete current_trx;
@@ -3324,12 +3339,12 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
         }
       }
     }
-    /*
+    
     dbug("is_trx_visible_to_read: trx_id: " + std::to_string(current_trx->trx_id) + 
          " last_trx_id: " + std::to_string(last_trx_id) + 
          " row_trx_id:" + std::to_string(row_trx_id) +
          " is_visible: " + std::to_string(is_visible)
-    );*/
+    );
   } 
   
 
