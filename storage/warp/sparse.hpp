@@ -43,7 +43,8 @@ private:
   int dirty=0;
   int have_lock=LOCK_UN;
   unsigned long long fpos = 0;
-  std::mutex set_bit_mtx;
+  unsigned long long filesize = 0;
+  //std::mutex set_bit_mtx;
 
 public:
   bool is_dirty() {
@@ -249,6 +250,9 @@ public:
         return -4;
       }
     }
+    fseek(fp, 0, SEEK_END);
+    filesize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
 
     /* read in the first block of bits */
     bits = 0;
@@ -386,22 +390,27 @@ public:
     lock(LOCK_SH);
     
     int bit_offset;
-    set_bit_mtx.lock();
+  //  set_bit_mtx.lock();
     unsigned long long at_byte = (bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1;
+    if(at_byte > filesize) {
+      fpos = at_byte;
+      bits = 0;
+      return 0;
+    }
     if(at_byte != fpos) {
       
-      fseek(fp, at_byte * 8, SEEK_SET);
-      fpos = at_byte*8;
+      fseek(fp, at_byte, SEEK_SET);
+      fpos = at_byte;
       size_t sz = fread(&bits, BLOCK_SIZE, 1, fp);
-      fseek(fp, at_byte*8, SEEK_SET); 
+      fseek(fp, at_byte, SEEK_SET); 
       if(sz == 0) { 
         bits = 0;
-        set_bit_mtx.unlock();
+ //       set_bit_mtx.unlock();
         return 0;
       }
     
     }
-    set_bit_mtx.unlock();
+//    set_bit_mtx.unlock();
     int retval = (bits >> bit_offset) & 1; 
     
     return retval ;
@@ -415,7 +424,7 @@ public:
     //bitmap_dbug("set_bit");
     assert(bitnum > 0);
     if (fp) clearerr(fp);
-    set_bit_mtx.lock();
+    //set_bit_mtx.lock();
  
     if(!fp || have_lock != LOCK_EX) {
       open(fname, LOCK_EX);
@@ -430,7 +439,7 @@ public:
       uint64_t log_bitnum = bitnum;
       sz = fwrite(&log_bitnum, BLOCK_SIZE, 1, log);
       if(sz != 1) {
-        set_bit_mtx.unlock();
+        //set_bit_mtx.unlock();
         return -1;
       }
     }
@@ -440,22 +449,22 @@ public:
 
     /* where to read at in file */
     unsigned long long at_byte = (bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1;
-    std::cout << "at byte: " << at_byte*8 << "\n";
+    std::cout << "at byte: " << at_byte << "\n";
     std::cout << "bitnum: " << bitnum << "\n";
     std::cout << "bit_offset: " << bit_offset << "\n";
     /* read the bits into memory if necessary */
-    if(at_byte*8 != fpos) {
+    if(at_byte != fpos) {
      std::cout << "reading\n";
-      fpos = at_byte*8;
-      fseek(fp, at_byte*8, SEEK_SET);
+      fpos = at_byte;
+      fseek(fp, at_byte, SEEK_SET);
       std::cout << "before: " << bits << "\n"; 
       sz = fread(&bits, BLOCK_SIZE, 1, fp);
       std::cout << "after: " << bits << "\n"; 
       if(ferror(fp)) {
-        set_bit_mtx.unlock();
+        //set_bit_mtx.unlock();
         return -2;
       }
-      fseek(fp, at_byte * 8, SEEK_SET); 
+      fseek(fp, at_byte, SEEK_SET); 
       //if(sz == 0 || feof(fp)) bits = 0;
     }
     std::cout << "before: " << bits; 
@@ -465,14 +474,14 @@ public:
       bits &= ~(1 << bit_offset);
     std::cout << "after: " << bits; 
 
-    if(at_byte*8 != fpos) {
-      fseek(fp, at_byte * 8, SEEK_SET);
-      fpos = at_byte*8;
+    if(at_byte != fpos) {
+      fseek(fp, at_byte, SEEK_SET);
+      fpos = at_byte;
     }
     sz = fwrite(&bits, BLOCK_SIZE, 1, fp);
     /* position back so that we don't read the block in again*/
-    fseek(fp, at_byte*8, SEEK_SET); 
-    set_bit_mtx.unlock();
+    fseek(fp, at_byte, SEEK_SET); 
+    //set_bit_mtx.unlock();
     return sz == 1 ? 0 : -2;
   }
 

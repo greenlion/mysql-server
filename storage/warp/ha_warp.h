@@ -231,12 +231,13 @@ class warp_pushdown_information {
   // than a tree index
   bool build_hash_index = false;
   
-  /*std::unordered_multimap<std::string, uint64_t> string_to_row_map;
+  std::string fact_filter = "";
+  /*
+  std::unordered_multimap<std::string, uint64_t> string_to_row_map;
   std::unordered_multimap<uint64_t, uint64_t> uint_to_row_map;
   std::unordered_multimap<int64_t, uint64_t> int_to_row_map;
   std::unordered_multimap<double, uint64_t> double_to_row_map;
   */
-
   // free up the fastbit resources once the table is finshed
   // being used
   
@@ -299,6 +300,8 @@ class warp_lock {
   int lock_type = 0;
 };
 
+// held during commit and rollback
+std::mutex commit_mtx;
 
 // markers for the transaction logs
 const char begin_marker     = 1;
@@ -335,8 +338,6 @@ class warp_trx {
   // LOCK_EX is taken on traversed visible rows
   bool for_update = false;
 
-  // held during commit and rollback
-  std::mutex commit_mtx;
   
   //the transaction identifier 
   ulonglong trx_id = 0;
@@ -384,7 +385,7 @@ class warp_global_data {
   std::mutex history_lock_mtx;
   std::string shutdown_clean_file = "shutdown_clean.warp";
   std::string warp_state_file     = "state.warp";
-  std::string commit_bitmap_file  = "commits.warp";
+  std::string commit_filename     = "commits.warp";
   std::string delete_bitmap_file  = "deletes.warp";
 
   uint64_t rowid_batch_size = 10000;
@@ -455,15 +456,12 @@ class warp_global_data {
   void write_clean_shutdown();
 
   public:
-  // bitmap into which committed transactions are persisted
-  // sparse bitmaps have write-ahead logging so a crash 
-  // during commit will result in the transaction never
-  // becoming visible
-  // note because the sparse bitmap implements locking
-  // the mutex does not need to be held to modify 
-  // the commit bitmap
-  sparsebitmap* commit_bitmap = NULL;
+  //sparsebitmap* commit_bitmap = NULL;
   sparsebitmap* delete_bitmap = NULL;
+  
+  std::unordered_map<uint64_t, bool> commit_list;
+  FILE* commit_file;
+  
   // opens and reads the state file.  
   // if the on-disk version of data is older than the current verion
   // the database will be upgraded.  If the on disk version is newer
@@ -537,6 +535,10 @@ class ha_warp : public handler {
 
 
  private:
+
+  ibis::partList* partitions;
+  ibis::partList::iterator part_it;
+
   void update_row_count();
   int reset_table();
   int encode_quote(uchar *buf);
@@ -577,9 +579,7 @@ class ha_warp : public handler {
 
   /* These objects are used by WARP to add functionality to Fastbit
      such as deletion/update of rows and transactions
-  */
-  sparsebitmap*        deleted_bitmap     = NULL;  
-  sparsebitmap*        commit_bitmap      = NULL;    
+  */    
   FILE*                insert_log         = NULL; 
 
   /* WHERE clause constructed from engine condition pushdown */

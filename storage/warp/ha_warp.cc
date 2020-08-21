@@ -982,105 +982,9 @@ int ha_warp::write_row(uchar *buf) {
   current_rowid = share->next_rowid--;
   
   mysql_mutex_unlock(&share->mutex);
-  auto current_trx = warp_get_trx(warp_hton, table->in_use);
-  assert(current_trx != NULL);
-  
-  /* check for duplicate key values */
-  int errcode = 0;
-  //last_trx_id = 0;
-  //uint64_t row_trx_id;
-  
-  // this function uses the table->field object to access the data
-  // in the row buffer!
-  
-  /* 
-  if(has_unique_keys() == true) {
-    make_unique_check_clause();
-    auto tbl = new ibis::mensa(share->data_dir_name); // base table
-    errcode = 0;
-    if(!tbl) {
-      errcode = HA_ERR_INDEX_CORRUPT;
-    } else {  
-      auto rows = // found table (select returns a table with the results)
-          tbl->select("r,t", unique_check_where_clause.c_str());
-      if(rows) {
-        auto csr = rows->createCursor();
-        uint64_t rowid=0;
-        int fetch_return_code = -1;
-        // if the next trx_id is the same as the last trx_id
-        // then the visibility check does not have to be done
-        // again
-        last_trx_id = 0;
-        is_visible = false;
-        
-        if(csr) {
-          for(uint64_t i=0;errcode == 0 && i<rows->nRows();++i) {
-            csr->fetch();
-            fetch_return_code  = csr->getColumnAsULong("r", rowid);
-            
-            if(fetch_return_code < 0) {
-              errcode = HA_ERR_INDEX_CORRUPT;
-              break;
-            }
-
-            fetch_return_code  = csr->getColumnAsULong("t", row_trx_id);
-            
-            // If this is our transaction, then the row is of course visible
-            // If the row_trx_id is zero then this table came from
-            // beta 1 and it is visible.  
-            // If this is the same transaction
-            // as the last transaction that was checked for visibility it
-            // does not have to be checked again, which avoid the expensive
-            // checking of the bitmap or iteration of open transctions.
-            if(last_trx_id != row_trx_id) {
-              last_trx_id = row_trx_id;
-              if(row_trx_id == current_trx->trx_id || row_trx_id == 0) {
-                is_visible = true;
-              } else {  
-                // since this is not our transaction, first check the commit
-                // bitmap.  If it was commited by another transaction then it
-                // is visible to the unique check
-                if(warp_state->commit_bitmap->is_set(row_trx_id)) {
-                  is_visible = true;
-                } else {
-                  // UNIQUE CHECKS MUST BE READ UNCOMMITED!
-                  // if the row was not committed, it is still visible if it 
-                  // was writen by another open transaction that has not yet
-                  // committed, so check the list of open transaction ids
-                  // and if the transaction is open, the row is visible to
-                  // the unique check
-                  is_visible = warp_state->is_transaction_open(row_trx_id);
-                } 
-              }  
-            }
-            
-            if(!is_visible) {
-              continue;
-            }
-            
-            if(fetch_return_code < 0) {
-              errcode = HA_ERR_INDEX_CORRUPT;
-              break;
-            }
-            
-            if(!warp_state->delete_bitmap->is_set(rowid)) {
-                errcode = HA_ERR_FOUND_DUPP_KEY;
-            }  
-          }
-          
-          delete csr;
-        }
-        
-        delete rows;
-      } 
-      
-      delete tbl;
-    }
+//  auto current_trx = warp_get_trx(warp_hton, table->in_use);
+//  assert(current_trx != NULL);
     
-    if(errcode != 0) DBUG_RETURN(errcode);   
-  }
-  */
-  
   /* This will return a cached writer unless a background
     write was started on the last insert.  In that case
     a new writer is constructed because the old one will
@@ -1390,9 +1294,9 @@ int ha_warp::repair(THD *, HA_CHECK_OPT *) {
 THR_LOCK_DATA **ha_warp::store_lock(THD *, THR_LOCK_DATA **to,
                                     enum thr_lock_type lock_type) {
   DBUG_ENTER("ha_warp::store_lock");
-  /*if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
+  if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
     lock.type = lock_type;
-  }*/
+  }
 
   *to++ = &lock;
   DBUG_RETURN(to);
@@ -1680,6 +1584,8 @@ int ha_warp::rnd_init(bool) {
   }
 
   if(pushdown_info->base_table != NULL) {
+    dbug("XXXhere1");
+    partitions = NULL;
     base_table = pushdown_info->base_table;
     filtered_table = pushdown_info->filtered_table;
     if(filtered_table != NULL && pushdown_info->cursor != NULL) {
@@ -1691,18 +1597,12 @@ int ha_warp::rnd_init(bool) {
       }
     }
   } else {
-    if(base_table == NULL) {
-      base_table = new ibis::mensa(share->data_dir_name);
-      filtered_table =
-      base_table->select(column_set.c_str(), push_where_clause.c_str());
-      if(filtered_table != NULL) {
-        /* Allocate a cursor for any queries that actually fetch columns */
-        cursor = filtered_table->createCursor();
-      }
-      pushdown_info->base_table = base_table;
-      pushdown_info->filtered_table = filtered_table;
-      pushdown_info->cursor = cursor;
-    }
+    dbug("YYYhere2");
+    base_table = NULL;
+    partitions = new ibis::partList;
+    ibis::util::gatherParts(*partitions, share->data_dir_name, true);
+    //dbug("Found partitions: " << cnt);
+    part_it = partitions->begin() + 1;
   }
 
   DBUG_RETURN(0);
@@ -1719,20 +1619,72 @@ int ha_warp::rnd_init(bool) {
    deleted.  If the row is deleted, another fetch must be attempted.
 */
 int ha_warp::rnd_next(uchar *buf) {
+  static uint64_t fetch_count = 0;
   DBUG_ENTER("ha_warp::rnd_next");
   uint64_t row_trx_id = 0;
-  
+  //dbug("here3");
+  if(partitions == NULL && base_table == NULL) {
+    DBUG_RETURN(HA_ERR_END_OF_FILE);
+  }
+//dbug("here4");
+  /* not scanning partitions and table is empty */
+  if((partitions == NULL && cursor == NULL) || (cursor != NULL && cursor->nRows() <= 0)) {
+    DBUG_RETURN(HA_ERR_END_OF_FILE);
+  } 
+
+fetch_again:  
+  if(partitions != NULL) {
+    if(part_it == partitions->end()) {
+      DBUG_RETURN(HA_ERR_END_OF_FILE);
+    }
+    if(cursor == NULL) {
+      dbug("cursor is NULL");
+      base_table = ibis::table::create((*part_it)->currentDataDir());
+      if(!base_table) {
+        DBUG_RETURN(HA_ERR_END_OF_FILE);
+      }
+      
+      dbug("opening filtere_table with pwc: " + push_where_clause);
+      filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+      if(!filtered_table) {
+        DBUG_RETURN(HA_ERR_END_OF_FILE);
+      }
+      
+      dbug("row in filtered table: " <<filtered_table->nRows() );
+      cursor = filtered_table->createCursor();
+      if(!cursor) {
+        DBUG_RETURN(HA_ERR_END_OF_FILE);
+      }
+    }
+  }
   ha_statistic_increment(&System_status_var::ha_read_rnd_next_count);
-
-  if(cursor == NULL || cursor->nRows() <= 0) {
-    DBUG_RETURN(HA_ERR_END_OF_FILE);
-  }
-
-fetch_again:
+  ++fetch_count;
   if(cursor->fetch() != 0) {
+    dbug("fetch failed after " << fetch_count << "fetches");
+    if(partitions != NULL) {
+      delete base_table;
+      delete filtered_table;
+      delete cursor;
+      
+      base_table = NULL;
+      filtered_table = NULL;
+      cursor = NULL;
+      dbug("move to next partition");
+      ++part_it;
+      if(part_it == partitions->end()) {
+        DBUG_RETURN(HA_ERR_END_OF_FILE);
+      }
+      
+      goto fetch_again;
+    }
     DBUG_RETURN(HA_ERR_END_OF_FILE);
   }
-  
+if(!cursor) {
+        DBUG_RETURN(HA_ERR_END_OF_FILE);
+      }
+  //DBUG_RETURN(HA_ERR_END_OF_FILE);
+
+  //dbug("hereZ");
   cursor->getColumnAsULong("t", row_trx_id);
   cursor->getColumnAsULong("r", current_rowid);
   
@@ -1786,6 +1738,33 @@ fetch_again:
 }
 
 /*
+  Called after each table scan.
+*/
+int ha_warp::rnd_end() {
+  DBUG_ENTER("ha_warp::rnd_end");
+  blobroot.Clear();
+  push_where_clause = "";
+  /* if scanning partitions the pointers are not
+     set in pushdown info and may need to be cleaned up
+     so delete them here
+  */
+  if(partitions != NULL) {
+    if(base_table != NULL) {
+      delete base_table;
+      delete cursor;
+      delete filtered_table;
+      delete partitions;
+    }
+    partitions = NULL;
+  }
+  
+  base_table = NULL;
+  filtered_table = NULL;
+  cursor = NULL;
+  DBUG_RETURN(0);
+}
+
+/*
   This records the current position *in the active cursor* for the current row.
   This is a logical reference to the row which doesn't have any meaning outside
   of this scan because scans will have different row numbers when the pushed
@@ -1817,24 +1796,7 @@ int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
   DBUG_RETURN(rc);
 }
 
-/*
-  Called after each table scan. In particular after deletes,
-  and updates.
-*/
-int ha_warp::rnd_end() {
-  DBUG_ENTER("ha_warp::rnd_end");
-  blobroot.Clear();
-  push_where_clause = "";
-  /*
-  delete base_table;
-  delete cursor;
-  delete filtered_table;
-  */
-  base_table = NULL;
-  filtered_table = NULL;
-  cursor = NULL;
-  DBUG_RETURN(0);
-}
+
 
 /*
 ulong ha_warp::index_flags(uint, uint, bool) const {
@@ -2211,18 +2173,21 @@ int ha_warp::engine_push(AQP::Table_access *table_aqp) {
 const Item *ha_warp::cond_push(const Item *cond, bool other_tbls_ok) {
   static int depth=0;
   static int unpushed_condition_count = 0;
+  static int condition_count = 0;
   static std::string where_clause = "";
   /* FIXME: only pushdown for SELECT */
   //if(lock.type != TL_READ) return cond;
 
   // reset the variables when called at depth 0
   if(depth == 0) {
+    condition_count = 0;
     unpushed_condition_count = 0;
     where_clause = "";
   }
 
   /* A simple comparison without conjuction or disjunction */
   if(cond->type() == Item::Type::FUNC_ITEM) {
+    condition_count++;
     int rc = append_column_filter(cond, where_clause);
     if(rc != 1) {
       unpushed_condition_count++;
@@ -2237,6 +2202,7 @@ const Item *ha_warp::cond_push(const Item *cond, bool other_tbls_ok) {
     where_clause += "(";
     for (uint i = 0; i < cnt; ++i) {
       auto item = items.pop();
+      condition_count++;
       if(i > 0) {
         if(item_cond->functype() == Item_func::Functype::COND_AND_FUNC) {
           where_clause += " AND ";
@@ -2254,6 +2220,7 @@ const Item *ha_warp::cond_push(const Item *cond, bool other_tbls_ok) {
          and pushdown evaluation will be abandoned.
       */
       ++depth;
+      
       if(cond_push(item, other_tbls_ok) != NULL) {
         unpushed_condition_count++;
         //items->push_back(item);
@@ -2264,7 +2231,14 @@ const Item *ha_warp::cond_push(const Item *cond, bool other_tbls_ok) {
     
     where_clause += ")";
   }
-  if(depth == 0) push_where_clause += where_clause;
+  
+  // only push a where clause if there were condtiions that were actually pushed
+  if(depth == 0 && (unpushed_condition_count != condition_count)){
+    //dbug(std::string(table->alias));
+    //dbug("!!!!!!total_cond_count: " << condition_count << " unpushed_cond_count: " << unpushed_condition_count);
+    push_where_clause += where_clause;
+  }
+  
   if(unpushed_condition_count>0) {
      return cond;
   }
@@ -2634,11 +2608,17 @@ int ha_warp::bitmap_merge_join() {
 
   std::string fact_pushdown_clause = "";
   std::string dim_pushdown_clause = "";
-  if(fact_pushdown_info->filter != "") {
+  /*if(fact_pushdown_info->filter != "") {
     fact_pushdown_clause = fact_pushdown_info->filter;
-  }
+  }*/
 
   for(auto join_it = fact_pushdown_info->join_info.begin(); join_it != fact_pushdown_info->join_info.end(); ++join_it) {
+    if(fact_pushdown_info->filter != "") {
+      fact_pushdown_clause = fact_pushdown_info->filter;
+    } else {
+      fact_pushdown_clause = "";
+    }
+
     //bool dim_full_table_scan = false;
     Field* fact_field = join_it->first;
 
@@ -2663,7 +2643,7 @@ int ha_warp::bitmap_merge_join() {
     std::string dim_nullname = std::string("n") + std::to_string(dim_field->field_index());
     bool fact_is_nullable = fact_field->is_nullable();
     bool dim_is_nullable = dim_field->is_nullable();
-
+    dbug("dim_filter_clause: " << dim_pushdown_info->filter);
     if(dim_pushdown_info->filter == "") {
       continue;
     } 
@@ -2717,6 +2697,15 @@ int ha_warp::bitmap_merge_join() {
       bool is_unsigned = fact_field->is_unsigned();
       int rc=0;
       switch(dim_field->real_type()) {
+        case MYSQL_TYPE_JSON:
+        case MYSQL_TYPE_TINY_BLOB:
+        case MYSQL_TYPE_MEDIUM_BLOB:
+        case MYSQL_TYPE_LONG_BLOB:
+        case MYSQL_TYPE_BLOB:
+        case MYSQL_TYPE_TYPED_ARRAY:
+          continue;
+        break;  
+
         case MYSQL_TYPE_TINY:
         case MYSQL_TYPE_YEAR: {
           if(is_unsigned) {
@@ -2854,13 +2843,19 @@ int ha_warp::bitmap_merge_join() {
     delete dim_cursor;
     dim_pushdown_info->cursor = NULL;
     fact_pushdown_clause += ")";
+    dim_pushdown_info->fact_filter = fact_pushdown_clause;
   } // end of dim tables loop   
   
   // set the pushdown clause for the table
   if(fact_pushdown_clause != "") {
     push_where_clause = fact_pushdown_clause;
   }
-
+  /*
+  FILE* out = fopen("/tmp/pushdown.txt", "w");
+  fwrite(push_where_clause.c_str(), push_where_clause.length(), 1, out);
+  fclose(out);
+  dbug("ZZZZZZZZZZZZZZZZZZZZZZZZZ");
+  */
   return 0;
 }
 
@@ -3029,7 +3024,13 @@ void warp_trx::commit() {
   char marker;
   dbug("commiting " << trx_id << "to disk");
   dbug("checking for dirty trx");
+  auto commit_it = warp_state->commit_list.find(trx_id);
   if(dirty) {
+    if(commit_it == warp_state->commit_list.end()) {
+      sql_print_error("Open transaction not in commit list");
+      assert(false);
+    }
+
     dbug("trx is dirty");
     // if(log == NULL || ftell(log) == 0) {
     //   if(log) fclose(log);
@@ -3045,19 +3046,14 @@ void warp_trx::commit() {
     }
     fsync(fileno(log));
     fseek(log, 0, SEEK_SET);
-    while(true) {
-      sz = fread(&marker, sizeof(marker), 1, log);
-      if(feof(log)) {
-        break;
-      }
-
+    while( (sz = fread(&marker, sizeof(marker), 1, log) == 1) ) {
       switch(marker) {
         case savepoint_marker:
           continue;
           break;
 
          case commit_marker:
-          goto done;
+          continue;
           break;
       
         case insert_marker:
@@ -3084,33 +3080,22 @@ void warp_trx::commit() {
       }
     } 
 
-done:
     // commit the deletes
     if(warp_state->delete_bitmap->commit() != 0) {
       sql_print_error("Failed to commit delete bitmap %s", warp_state->delete_bitmap->get_fname().c_str());
       assert(false);
     }
-    //warp_state->delete_bitmap->close(1);
     
     // mark the transaction committed
-    dbug("warp_trx::commit -> setting commit bit for:" << trx_id);
-    if(warp_state->commit_bitmap->set_bit(trx_id) != 0) {
-      sql_print_error("Failed to set bit in delete bitmap %s", warp_state->commit_bitmap->get_fname().c_str());
-      assert(false);
-    } 
-    
-    // fail if trx is not in the bitmap!
-    assert(warp_state->commit_bitmap->get_bit(trx_id));
-    
-    if(warp_state->commit_bitmap->commit() != 0) {
-      sql_print_error("Failed to commit bits in commit bitmap %s", warp_state->commit_bitmap->get_fname().c_str());
+    int sz = fwrite(&trx_id, sizeof(trx_id), 1, warp_state->commit_file);
+    if(sz != 1) {
+      sql_print_error("Failed to write to commits file");
       assert(false);
     }
+    fsync(fileno(warp_state->commit_file));
+
+    commit_it->second = true;
     
-    // fail if trx is not in the bitmap!
-    assert(warp_state->commit_bitmap->get_bit(trx_id));
-    
-    //warp_state->commit_bitmap->close(1);
     fclose(log);
     unlink(log_filename.c_str());
     log = NULL;
@@ -3122,85 +3107,93 @@ done:
 // used when a transaction or statement rolls back
 void warp_trx::rollback(bool all) {
   commit_mtx.lock();
+  auto commit_it = warp_state->commit_list.find(trx_id);
   size_t savepoint_at = 0;
   uint64_t rowid = 0;
   char marker;
   if(dirty) {
-    if(log != NULL && ftell(log) != 0) {
-      int sz;
-      if(all != ROLLBACK_STATEMENT) {
-        sz = fwrite(&rollback_marker, sizeof(rollback_marker), 1, log);
-        if(sz != 1) {
-          sql_print_error("failed to write rollback marker into transaction log");
-        }
-      } 
-      fsync(fileno(log));
-      fseek(log, 0, SEEK_SET);
-      clearerr(log);
-    
-      while(true) {
-        sz = fread(&marker, sizeof(marker), 1, log);
-        
-        switch(marker) {
-          case rollback_marker:
-            goto done;
-            break;
-
-          case savepoint_marker:
-            savepoint_at = ftell(log) - sizeof(marker);
-            continue;
-            break;
-
-          case insert_marker:
-            if(all == ROLLBACK_STATEMENT && savepoint_at == 0) {
-              fseek(log, sizeof(uint64_t), SEEK_CUR);
-            }
-            if(all == ROLLBACK_STATEMENT) {
-              sz = fread(&rowid, sizeof(uint64_t), 1, log);
-              if(feof(log)) {
-                goto done;
-              }
-              if(sz != 1) {
-                sql_print_error("could not read from transaction log");
-                assert(false);
-              }
-              // delete this insert, which is equivalent to rolling it back
-              if(warp_state->delete_bitmap->set_bit(rowid) != 0) {
-                sql_print_error("could not set bit in deleted bitmap");
-                assert(false);
-              }
-            }
-            // do not have to roll back insertions as they will not be
-            // in the commit bitmap
-            break;
-          case delete_marker:
-            //row will be unlocked at trx delete
-            //seek past the rowid
-            fseek(log, sizeof(uint64_t), SEEK_CUR);
-            break;
-        }
-      } 
-done:      
-      // need to commit the rolled back inserts to the delete bitmap
-      if(all==ROLLBACK_STATEMENT) {
-        if(warp_state->delete_bitmap->is_dirty()) {
-          if(warp_state->delete_bitmap->commit() != 0) {
-            sql_print_error("could not commit delete bitmap for rollback of statement");
-            assert(false);
-          }
-        }
-        //warp_state->delete_bitmap->close(1);
-        // remove the savepoint data
-        if(savepoint_at > 0) {
-          ftruncate(fileno(log), savepoint_at);
-          fsync(fileno(log));
-        }
-      }
-      fclose(log);
-      log = NULL;
-      unlink(log_filename.c_str());
+    if(commit_it == warp_state->commit_list.end()) {
+      sql_print_error("Open transaction not in commit list");
+      assert(false);
     }
+    int sz;
+    if(all != ROLLBACK_STATEMENT) {
+      sz = fwrite(&rollback_marker, sizeof(rollback_marker), 1, log);
+      if(sz != 1) {
+        sql_print_error("failed to write rollback marker into transaction log");
+      }
+    } 
+    fsync(fileno(log));
+    fseek(log, 0, SEEK_SET);
+    clearerr(log);
+  
+    while((sz = fread(&marker, sizeof(marker), 1, log))) {
+      switch(marker) {
+        case rollback_marker:
+          // nothing to do - end of log
+        break;
+
+        case savepoint_marker:
+          savepoint_at = ftell(log) - sizeof(marker);
+          continue;
+        break;
+
+        case insert_marker:
+          if(all == ROLLBACK_STATEMENT && savepoint_at == 0) {
+            fseek(log, sizeof(uint64_t), SEEK_CUR);
+          }
+          if(all == ROLLBACK_STATEMENT) {
+            sz = fread(&rowid, sizeof(uint64_t), 1, log);
+            if(feof(log)) {
+              break;
+            }
+            if(sz != 1) {
+              sql_print_error("could not read from transaction log");
+              assert(false);
+            }
+            // delete this insert, which is equivalent to rolling it back
+            if(warp_state->delete_bitmap->set_bit(rowid) != 0) {
+              sql_print_error("could not set bit in deleted bitmap");
+              assert(false);
+            }
+          }
+          // do not have to roll back insertions as they will not be
+          // in the commit bitmap
+        break;
+
+        case delete_marker:
+          //row will be unlocked at trx delete
+          //seek past the rowid
+          fseek(log, sizeof(uint64_t), SEEK_CUR);
+        break;
+      }
+    } 
+    /* was dirty */
   }
+
+  // need to commit the rolled back inserts to the delete bitmap
+  if(all==ROLLBACK_STATEMENT) {
+    if(warp_state->delete_bitmap->is_dirty()) {
+      if(warp_state->delete_bitmap->commit() != 0) {
+        sql_print_error("could not commit delete bitmap for rollback of statement");
+        assert(false);
+      }
+    }
+  
+    // remove the savepoint data
+    if(savepoint_at > 0) {
+      ftruncate(fileno(log), savepoint_at);
+      fsync(fileno(log));
+    }
+  } else {
+    /* TRX rollback removes the trx from the commit list */
+
+    warp_state->commit_list.erase(commit_it);
+    fclose(log);
+    log = NULL;
+    unlink(log_filename.c_str());
+  } 
+
   commit_mtx.unlock();
 }
 
@@ -3226,7 +3219,7 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
     if(current_trx->dirty) {
        dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " calling commit!");
        current_trx->commit();
-       warp_state->mark_transaction_closed(current_trx->trx_id);
+       // warp_state->mark_transaction_closed(current_trx->trx_id);
     }
   } else {
       /* this transaction is not ready to be committed to the
@@ -3264,7 +3257,7 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
       // undo the changes
       trx->rollback(true);  
       // remove the transaction from the open list
-      warp_state->mark_transaction_closed(trx->trx_id);
+      //warp_state->mark_transaction_closed(trx->trx_id);
     }
   } else {
     //statement rollback
@@ -3272,7 +3265,7 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
         trx->rollback(ROLLBACK_STATEMENT);
     }
     if(trx->autocommit) {
-      warp_state->mark_transaction_closed(trx->trx_id);
+      //warp_state->mark_transaction_closed(trx->trx_id);
       trx->dirty = false;
     } else {
       return 0;
@@ -3284,7 +3277,9 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
   return 0;
 }
+
 bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
+  //return true;
   uint64_t history_trx_id = warp_state->get_history_lock(rowid);
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
@@ -3304,51 +3299,52 @@ bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
   is_visible = true;
   return true;
 }
+
 // checks the transaction marker to see if if this
 // row is visible
 bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
-  
+  if(last_trx_id == row_trx_id) {
+    return is_visible;
+  }
+  dbug("here!!");
+  last_trx_id = row_trx_id;
+
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
-  if(last_trx_id != row_trx_id) {
-    /*dbug("is_trx_visible_to_read: trx_id: " + std::to_string(current_trx->trx_id) + 
-         " last_trx_id: " + std::to_string(last_trx_id) + 
-         " row_trx_id:" + std::to_string(row_trx_id) 
-    );*/
-    last_trx_id = row_trx_id;
-    if(current_trx->trx_id == row_trx_id || row_trx_id == 0) {
-      is_visible = true;
-    } else {
-      if(row_trx_id < current_trx->trx_id) {
-        // row_trx_id is older!
-        if(warp_state->commit_bitmap->is_set(row_trx_id)) {
-          is_visible = true;
-        } else {
-          is_visible = false;
-        }
-      } else {
-        // row_trx_id is newer!
-        if (current_trx->isolation_level == ISO_REPEATABLE_READ || current_trx->isolation_level == ISO_SERIALIZABLE) { 
-          is_visible = false;
-        } else {
-          if(warp_state->commit_bitmap->is_set(row_trx_id)) {
-            is_visible = true;
-          } else {
-            is_visible = false;
-          }
-        }
-      }
-    }
-    
-    dbug("is_trx_visible_to_read: trx_id: " + std::to_string(current_trx->trx_id) + 
-         " last_trx_id: " + std::to_string(last_trx_id) + 
-         " row_trx_id:" + std::to_string(row_trx_id) +
-         " is_visible: " + std::to_string(is_visible)
-    );
-  } 
+  auto commit_it = warp_state->commit_list.find(row_trx_id);
   
+  /* row belongs to current trx so it is visible */
+  if(current_trx->trx_id == row_trx_id) {
+    is_visible = true;
+    return is_visible;
+  }
+  
+  /* not on the commit list so it was rolled back or not recovered */
+  if(commit_it == warp_state->commit_list.end()) {
+    is_visible = false;
+    return is_visible;
+  }
 
+  /* older trx are only visible if committed */
+  if(row_trx_id < current_trx->trx_id) {
+    if(commit_it->second == false) {
+      is_visible = false;
+    } else {
+      is_visible = true;
+    }
+    return is_visible;
+  }
+
+  // row_trx_id is newer and RR or SERIALIZABLE thus not visible due to isolation level
+  if (current_trx->isolation_level == ISO_REPEATABLE_READ || current_trx->isolation_level == ISO_SERIALIZABLE) { 
+    is_visible = false;
+    return is_visible;
+  }
+
+  // if RC or RU if the trx is committed it is visible
+  is_visible = commit_it->second;
   return is_visible;
+
 }
 
 /* Internal functions for maintaining and working with
@@ -3492,13 +3488,23 @@ warp_global_data::warp_global_data() {
   // this file will be rewritten at clean shutdown
   unlink(shutdown_clean_file.c_str());
   
-  // this will create the commits.warp bitmap if it does not exist
-  try {
-    commit_bitmap = new sparsebitmap(commit_bitmap_file, LOCK_SH); 
-  } catch(...) {
-    sql_print_error("Could not open commit bitmap: %s", commit_bitmap_file.c_str());
+  commit_file = fopen(commit_filename.c_str(), "ab+");
+  if(!commit_file) {    
+    sql_print_error("Could not open commit file: %s", commit_filename.c_str());
     assert(false);
   }
+  fseek(commit_file, 0, SEEK_SET);
+  int sz = 0;
+  uint64_t trx_id;
+
+  /* load list of committed transactions to the commit list */
+  dbug("reading committed transactions");
+  while( (sz = fread(&trx_id, sizeof(trx_id), 1, commit_file)) == 1) {
+    dbug("added trx to commit list: " << trx_id);
+    commit_list.emplace(std::pair<uint64_t, bool>(trx_id, true));
+  }
+  dbug("committed trx read completed");
+
   // this will create the commits.warp bitmap if it does not exist
   try {
     delete_bitmap = new sparsebitmap(delete_bitmap_file, LOCK_SH); 
@@ -3537,21 +3543,21 @@ warp_global_data::warp_global_data() {
 bool warp_global_data::check_state() {
   struct stat st;
   int state_exists = (stat(warp_state_file.c_str(), &st) == 0);
-  int commit_bitmap_exists = (stat(commit_bitmap_file.c_str(), &st) == 0);
+  int commit_file_exists = (stat(commit_filename.c_str(), &st) == 0);
   
-  if((state_exists && !commit_bitmap_exists)) {
+  if((state_exists && !commit_file_exists)) {
     sql_print_error("warp_state found but commits.warp is missing! Database can not be initialized.");
     return false;
   } 
   
-  if((!state_exists && commit_bitmap_exists)) {
-    sql_print_error("WARP commits.warp is found but warp_state is missing! Database can not be initialized.");
+  if((!state_exists && commit_file_exists)) {
+    sql_print_error("commits.warp is found but warp_state is missing! Database can not be initialized.");
     return false;
   } 
   
   ibis::partList parts;
   int has_warp_tables = ibis::util::gatherParts(parts, std::string(".").c_str());
-  if(!state_exists && !commit_bitmap_exists && has_warp_tables > 0) {
+  if(!state_exists && !commit_file_exists && has_warp_tables > 0) {
     sql_print_error("WARP tables found but database state is missing! This may be a beta 1 database. WARP can not be initialized.");
     return false;
   }
@@ -3574,28 +3580,31 @@ uint64_t warp_global_data::get_next_rowid_batch() {
   return next_rowid;
 }
 
+/* Only transactions that are for write are registered on the transaction list
+   called in ::external_lock when a transaction first makes changes
+*/
 void warp_global_data::register_open_trx(uint64_t trx_id) {
-   mtx.lock();
-   open_write_trx.push_front(trx_id);
-   mtx.unlock();
+  dbug("registering open transaction: " << trx_id );
+  commit_mtx.lock();
+  commit_list.emplace(std::pair<uint64_t, bool>(trx_id, false));
+  commit_mtx.unlock();
 }
 
-void warp_global_data::mark_transaction_closed(uint64_t trx_id) {
-  mtx.lock();
-  open_write_trx.remove(trx_id);
-  mtx.unlock();
-}
-
+/* if trx not on commit list it is either rolled back or has not made any changes yet
+   if trx is on commit list and is false then the transaction is open for writes
+   if it is true then the transaction is committed 
+*/
 bool warp_global_data::is_transaction_open(uint64_t trx_id) {
   bool retval = false;
-  mtx.lock();
-  for(auto it = open_write_trx.begin();it != open_write_trx.end();++it) {
-    if(*it == trx_id) {
-      retval = true;  
-      break;
-    } 
+  commit_mtx.lock();
+  auto commit_it = commit_list.find(trx_id);
+  if(commit_it == commit_list.end()) {
+    retval = false;
+  } else {
+
+    retval = (commit_it->second == false);
   }
-  mtx.unlock();
+  commit_mtx.unlock();
   return retval;
 }
 
@@ -3963,17 +3972,19 @@ uint64_t warp_global_data::get_history_lock(uint64_t rowid) {
 }
 
 warp_global_data::~warp_global_data() {
+  fclose(commit_file);
+  /*
   if(commit_bitmap->close(1) != 0) {
     sql_print_error("Could not close bitmap %s", commit_bitmap->get_fname().c_str());
     assert(false);
-  }
+  }*/
   if(delete_bitmap->close(1) != 0) {
     sql_print_error("Could not close bitmap %s", delete_bitmap->get_fname().c_str());
     assert(false);
   }
   write();
   fclose(fp);
-  commit_bitmap = NULL;
+  //commit_bitmap = NULL;
   write_clean_shutdown();
 }
 
