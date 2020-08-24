@@ -1294,9 +1294,9 @@ int ha_warp::repair(THD *, HA_CHECK_OPT *) {
 THR_LOCK_DATA **ha_warp::store_lock(THD *, THR_LOCK_DATA **to,
                                     enum thr_lock_type lock_type) {
   DBUG_ENTER("ha_warp::store_lock");
-  if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
-    lock.type = lock_type;
-  }
+  //if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
+  //  lock.type = lock_type;
+  //}
 
   *to++ = &lock;
   DBUG_RETURN(to);
@@ -1584,7 +1584,6 @@ int ha_warp::rnd_init(bool) {
   }
 
   if(pushdown_info->base_table != NULL) {
-    dbug("XXXhere1");
     partitions = NULL;
     base_table = pushdown_info->base_table;
     filtered_table = pushdown_info->filtered_table;
@@ -1597,7 +1596,6 @@ int ha_warp::rnd_init(bool) {
       }
     }
   } else {
-    dbug("YYYhere2");
     base_table = NULL;
     partitions = new ibis::partList;
     ibis::util::gatherParts(*partitions, share->data_dir_name, true);
@@ -1622,11 +1620,11 @@ int ha_warp::rnd_next(uchar *buf) {
   static uint64_t fetch_count = 0;
   DBUG_ENTER("ha_warp::rnd_next");
   uint64_t row_trx_id = 0;
-  //dbug("here3");
+
   if(partitions == NULL && base_table == NULL) {
     DBUG_RETURN(HA_ERR_END_OF_FILE);
   }
-//dbug("here4");
+
   /* not scanning partitions and table is empty */
   if((partitions == NULL && cursor == NULL) || (cursor != NULL && cursor->nRows() <= 0)) {
     DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -1638,19 +1636,16 @@ fetch_again:
       DBUG_RETURN(HA_ERR_END_OF_FILE);
     }
     if(cursor == NULL) {
-      dbug("cursor is NULL");
       base_table = ibis::table::create((*part_it)->currentDataDir());
       if(!base_table) {
         DBUG_RETURN(HA_ERR_END_OF_FILE);
       }
       
-      dbug("opening filtere_table with pwc: " + push_where_clause);
       filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
       if(!filtered_table) {
         DBUG_RETURN(HA_ERR_END_OF_FILE);
       }
       
-      dbug("row in filtered table: " <<filtered_table->nRows() );
       cursor = filtered_table->createCursor();
       if(!cursor) {
         DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -1660,7 +1655,6 @@ fetch_again:
   ha_statistic_increment(&System_status_var::ha_read_rnd_next_count);
   ++fetch_count;
   if(cursor->fetch() != 0) {
-    dbug("fetch failed after " << fetch_count << "fetches");
     if(partitions != NULL) {
       delete base_table;
       delete filtered_table;
@@ -1669,7 +1663,7 @@ fetch_again:
       base_table = NULL;
       filtered_table = NULL;
       cursor = NULL;
-      dbug("move to next partition");
+      delete *part_it;
       ++part_it;
       if(part_it == partitions->end()) {
         DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -1684,7 +1678,6 @@ if(!cursor) {
       }
   //DBUG_RETURN(HA_ERR_END_OF_FILE);
 
-  //dbug("hereZ");
   cursor->getColumnAsULong("t", row_trx_id);
   cursor->getColumnAsULong("r", current_rowid);
   
@@ -2234,8 +2227,6 @@ const Item *ha_warp::cond_push(const Item *cond, bool other_tbls_ok) {
   
   // only push a where clause if there were condtiions that were actually pushed
   if(depth == 0 && (unpushed_condition_count != condition_count)){
-    //dbug(std::string(table->alias));
-    //dbug("!!!!!!total_cond_count: " << condition_count << " unpushed_cond_count: " << unpushed_condition_count);
     push_where_clause += where_clause;
   }
   
@@ -2643,7 +2634,7 @@ int ha_warp::bitmap_merge_join() {
     std::string dim_nullname = std::string("n") + std::to_string(dim_field->field_index());
     bool fact_is_nullable = fact_field->is_nullable();
     bool dim_is_nullable = dim_field->is_nullable();
-    dbug("dim_filter_clause: " << dim_pushdown_info->filter);
+
     if(dim_pushdown_info->filter == "") {
       continue;
     } 
@@ -2850,12 +2841,7 @@ int ha_warp::bitmap_merge_join() {
   if(fact_pushdown_clause != "") {
     push_where_clause = fact_pushdown_clause;
   }
-  /*
-  FILE* out = fopen("/tmp/pushdown.txt", "w");
-  fwrite(push_where_clause.c_str(), push_where_clause.length(), 1, out);
-  fclose(out);
-  dbug("ZZZZZZZZZZZZZZZZZZZZZZZZZ");
-  */
+
   return 0;
 }
 
@@ -3022,8 +3008,7 @@ void warp_trx::commit() {
   int sz = 0;
   uint64_t rowid = 0;
   char marker;
-  dbug("commiting " << trx_id << "to disk");
-  dbug("checking for dirty trx");
+
   auto commit_it = warp_state->commit_list.find(trx_id);
   if(dirty) {
     if(commit_it == warp_state->commit_list.end()) {
@@ -3031,7 +3016,6 @@ void warp_trx::commit() {
       assert(false);
     }
 
-    dbug("trx is dirty");
     // if(log == NULL || ftell(log) == 0) {
     //   if(log) fclose(log);
     //   unlink(log_filename.c_str());
@@ -3214,10 +3198,10 @@ warp_trx* warp_get_trx(handlerton* hton, THD* thd) {
 */
 int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
   auto current_trx = warp_get_trx(hton, thd);
-  dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx));
+  //dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx));
   if(commit_trx || current_trx->autocommit) {
     if(current_trx->dirty) {
-       dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " calling commit!");
+       //dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " calling commit!");
        current_trx->commit();
        // warp_state->mark_transaction_closed(current_trx->trx_id);
     }
@@ -3233,7 +3217,7 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
      commited to disk, then the transaction information for
      the connection must be destroyed.
   */
-  dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " destroy trx.");
+  //dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " destroy trx.");
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
   warp_state->free_locks(current_trx);
   delete current_trx;
@@ -3306,7 +3290,6 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
   if(last_trx_id == row_trx_id) {
     return is_visible;
   }
-  dbug("here!!");
   last_trx_id = row_trx_id;
 
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
@@ -3498,12 +3481,12 @@ warp_global_data::warp_global_data() {
   uint64_t trx_id;
 
   /* load list of committed transactions to the commit list */
-  dbug("reading committed transactions");
+  //dbug("reading committed transactions");
   while( (sz = fread(&trx_id, sizeof(trx_id), 1, commit_file)) == 1) {
-    dbug("added trx to commit list: " << trx_id);
+    //dbug("added trx to commit list: " << trx_id);
     commit_list.emplace(std::pair<uint64_t, bool>(trx_id, true));
   }
-  dbug("committed trx read completed");
+  //dbug("committed trx read completed");
 
   // this will create the commits.warp bitmap if it does not exist
   try {
@@ -3584,7 +3567,7 @@ uint64_t warp_global_data::get_next_rowid_batch() {
    called in ::external_lock when a transaction first makes changes
 */
 void warp_global_data::register_open_trx(uint64_t trx_id) {
-  dbug("registering open transaction: " << trx_id );
+  //dbug("registering open transaction: " << trx_id );
   commit_mtx.lock();
   commit_list.emplace(std::pair<uint64_t, bool>(trx_id, false));
   commit_mtx.unlock();

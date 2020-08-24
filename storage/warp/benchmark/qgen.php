@@ -1,7 +1,7 @@
 #!/usr/bin/php
 <?php
-set_include_path(get_include_path() . ':.:../..//include');
-require_once('shard-query.php');
+#set_include_path(get_include_path() . ':.:../..//include');
+#require_once('shard-query.php');
 class DRV_MYSQL extends StdClass {
 	var $_handle = false;
 	var $_opts = "";
@@ -95,7 +95,7 @@ def("DB_DRIVER",'d', 'mysql');
 def("WORKLOAD",'W', 'ssb');
 def("LOOP_COUNT",'L', 1);
 def("SCALE", 'F', 1);
-def("DB_SCHEMA",'S','tokudb');
+def("DB_SCHEMA",'S','test2');
 def("RANDOMIZE", 'r', 'false');
 
 require_once($options->WORKLOAD . '.php');
@@ -114,7 +114,7 @@ foreach($argv as $v) {
 echo "\n";
 
 for($z=0;$z<$options->LOOP_COUNT;++$z) {
-		if($options->RANDOMIZE !== 'false') shuffle($q[$options->WORKLOAD]);
+		#if($options->RANDOMIZE !== 'false') shuffle($q[$options->WORKLOAD]);
 		$driver="DRV_" . $options->DB_DRIVER;	
 		$db = new $driver;
 		foreach($q as $qry) {
