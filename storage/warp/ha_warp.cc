@@ -1294,9 +1294,9 @@ int ha_warp::repair(THD *, HA_CHECK_OPT *) {
 THR_LOCK_DATA **ha_warp::store_lock(THD *, THR_LOCK_DATA **to,
                                     enum thr_lock_type lock_type) {
   DBUG_ENTER("ha_warp::store_lock");
-  //if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
-  //  lock.type = lock_type;
-  //}
+  if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
+    lock.type = lock_type;
+  }
 
   *to++ = &lock;
   DBUG_RETURN(to);
@@ -4007,7 +4007,7 @@ const char* get_table_with_most_rows(std::unordered_map<const char*, uint64_t>* 
   uint64_t max_cnt = 0;
   const char* table_with_max_cnt = NULL;
   for(auto it = table_counts->begin(); it != table_counts->end(); it++) {
-    if(it->second > max_cnt) {
+    if(it->second >= max_cnt) {
       max_cnt = it->second;
       table_with_max_cnt = it->first;
     }
