@@ -530,7 +530,7 @@ class ha_warp : public handler {
 
  /* used in visibility checks */
  uint64_t last_trx_id = 0;
- bool is_visible = false;
+ bool is_trx_visible = false;
  //warp_trx* current_trx = NULL;
 
 

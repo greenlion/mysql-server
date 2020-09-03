@@ -1673,24 +1673,27 @@ fetch_again:
     }
     DBUG_RETURN(HA_ERR_END_OF_FILE);
   }
-if(!cursor) {
-        DBUG_RETURN(HA_ERR_END_OF_FILE);
-      }
+  
+  if(!cursor) {
+    DBUG_RETURN(HA_ERR_END_OF_FILE);
+  }
+  
   //DBUG_RETURN(HA_ERR_END_OF_FILE);
-
   cursor->getColumnAsULong("t", row_trx_id);
   cursor->getColumnAsULong("r", current_rowid);
   
-  /* This sets is_visible handler variable!
+  /* This sets is_trx_visible handler variable!
      If we already checked this trx_id in the last iteration
      then it does not have to be checked again and the
-     is_visible variable does not change. This function
+     is_trx_visible variable does not change. This function
      also sets last_trx_id to the transaction being c
      checked if the value is not the same as this 
      transaction.
   */
+ 
   is_trx_visible_to_read(row_trx_id);
-  if(!is_visible) {
+  
+  if(!is_trx_visible) {
     goto fetch_again;
   }
   
@@ -1699,9 +1702,11 @@ if(!cursor) {
   // because the delete_rows bitmap has bits possibly committed
   // from future transaction, a history lock is created to 
   // maintain row visiblity
+  
   if(!is_row_visible_to_read(current_rowid)) {
     goto fetch_again;
   }
+  
 /*
   int lock_taken = 0;
   if(current_trx->lock_in_share_mode) {
@@ -3267,20 +3272,19 @@ bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
   uint64_t history_trx_id = warp_state->get_history_lock(rowid);
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
+
   if(history_trx_id == 0 
     || history_trx_id < current_trx->trx_id 
-    || (history_trx_id > current_trx->trx_id && current_trx->isolation_level != ISO_REPEATABLE_READ)) {
+    || (history_trx_id > current_trx->trx_id && (current_trx->isolation_level != ISO_REPEATABLE_READ && current_trx->isolation_level != ISO_SERIALIZABLE))) {
     // no history lock or may have been commited into delete map
     // in earlier trx so have to check to see if the row is deleted
     if(is_deleted(current_rowid)) {
-      is_visible = false;
       return false;
     }
   } else {
-      is_visible = false;
-      return false;
+    return false;
   }
-  is_visible = true;
+
   return true;
 }
 
@@ -3288,7 +3292,7 @@ bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
 // row is visible
 bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
   if(last_trx_id == row_trx_id) {
-    return is_visible;
+    return is_trx_visible;
   }
   last_trx_id = row_trx_id;
 
@@ -3298,35 +3302,35 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
   
   /* row belongs to current trx so it is visible */
   if(current_trx->trx_id == row_trx_id) {
-    is_visible = true;
-    return is_visible;
+    is_trx_visible = true;
+    return is_trx_visible;
   }
   
   /* not on the commit list so it was rolled back or not recovered */
   if(commit_it == warp_state->commit_list.end()) {
-    is_visible = false;
-    return is_visible;
+    is_trx_visible = false;
+    return is_trx_visible;
   }
 
   /* older trx are only visible if committed */
   if(row_trx_id < current_trx->trx_id) {
     if(commit_it->second == false) {
-      is_visible = false;
+      is_trx_visible = false;
     } else {
-      is_visible = true;
+      is_trx_visible = true;
     }
-    return is_visible;
+    return is_trx_visible;
   }
 
   // row_trx_id is newer and RR or SERIALIZABLE thus not visible due to isolation level
   if (current_trx->isolation_level == ISO_REPEATABLE_READ || current_trx->isolation_level == ISO_SERIALIZABLE) { 
-    is_visible = false;
-    return is_visible;
+    is_trx_visible = false;
+    return is_trx_visible;
   }
 
   // if RC or RU if the trx is committed it is visible
-  is_visible = commit_it->second;
-  return is_visible;
+  is_trx_visible = commit_it->second;
+  return is_trx_visible;
 
 }
 
