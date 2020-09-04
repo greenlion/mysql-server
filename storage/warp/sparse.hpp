@@ -397,6 +397,7 @@ public:
       bits = 0;
       return 0;
     }
+
     if(at_byte != fpos) {
       
       fseek(fp, at_byte, SEEK_SET);
@@ -449,31 +450,24 @@ public:
 
     /* where to read at in file */
     unsigned long long at_byte = (bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1;
-    std::cout << "at byte: " << at_byte << "\n";
-    std::cout << "bitnum: " << bitnum << "\n";
-    std::cout << "bit_offset: " << bit_offset << "\n";
+
     /* read the bits into memory if necessary */
     if(at_byte != fpos) {
-     std::cout << "reading\n";
       fpos = at_byte;
       fseek(fp, at_byte, SEEK_SET);
-      std::cout << "before: " << bits << "\n"; 
       sz = fread(&bits, BLOCK_SIZE, 1, fp);
-      std::cout << "after: " << bits << "\n"; 
+  
       if(ferror(fp)) {
-        //set_bit_mtx.unlock();
         return -2;
       }
       fseek(fp, at_byte, SEEK_SET); 
-      //if(sz == 0 || feof(fp)) bits = 0;
     }
-    std::cout << "before: " << bits; 
+  
     if(mode == MODE_SET)
       bits |= 1 << bit_offset; 
     else
       bits &= ~(1 << bit_offset);
-    std::cout << "after: " << bits; 
-
+  
     if(at_byte != fpos) {
       fseek(fp, at_byte, SEEK_SET);
       fpos = at_byte;
@@ -481,6 +475,9 @@ public:
     sz = fwrite(&bits, BLOCK_SIZE, 1, fp);
     /* position back so that we don't read the block in again*/
     fseek(fp, at_byte, SEEK_SET); 
+    if(at_byte > filesize) {
+      filesize = at_byte;
+    }
     //set_bit_mtx.unlock();
     return sz == 1 ? 0 : -2;
   }

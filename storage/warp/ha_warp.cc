@@ -1046,11 +1046,13 @@ int ha_warp::update_row(const uchar *, uchar *new_data) {
   DBUG_ENTER("ha_warp::update_row");
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
-  int lock_taken = warp_state->create_lock(current_rowid, current_trx, WRITE_INTENTION);
+  
+  int lock_taken = warp_state->create_lock(current_rowid, current_trx, LOCK_EX);
   /* if deadlock or lock timeout return the error*/
   if(lock_taken != LOCK_EX) {
     DBUG_RETURN(lock_taken);
   }
+
   // current_rowid will be changed by write_row so save the 
   // value now
   uint64_t deleted_rowid = current_rowid;
@@ -1058,6 +1060,7 @@ int ha_warp::update_row(const uchar *, uchar *new_data) {
   // if the write fails (for example due to duplicate key then
   // the statement will be rolled back and the deleted row 
   // will be 
+  
   int retval = write_row(new_data);
   if(retval == 0) {
   // only log the delete and create the history lock 
@@ -1065,8 +1068,9 @@ int ha_warp::update_row(const uchar *, uchar *new_data) {
   // will still be held so the update can be retried
   // without having to lock the row again. 
     current_trx->write_delete_log_rowid(deleted_rowid);
-    warp_state->create_lock(current_rowid, current_trx, LOCK_HISTORY);
+    warp_state->create_lock(deleted_rowid, current_trx, LOCK_HISTORY);
   }
+  
   ha_statistic_increment(&System_status_var::ha_update_count);
   
   DBUG_RETURN(retval);
@@ -1252,6 +1256,12 @@ void ha_warp::maintain_indexes(char *datadir, TABLE *table) {
    work.
 */
 int ha_warp::extra(enum ha_extra_function) {
+  /* if not bulk insert, and there are buffered inserts, write them out
+     to disk.  This will destroy the writer.
+  */
+  if(writer != NULL) {
+    write_buffered_rows_to_disk();
+  }
   return 0;
 }
 
@@ -1681,7 +1691,7 @@ fetch_again:
   //DBUG_RETURN(HA_ERR_END_OF_FILE);
   cursor->getColumnAsULong("t", row_trx_id);
   cursor->getColumnAsULong("r", current_rowid);
-  
+
   /* This sets is_trx_visible handler variable!
      If we already checked this trx_id in the last iteration
      then it does not have to be checked again and the
@@ -1694,6 +1704,7 @@ fetch_again:
   is_trx_visible_to_read(row_trx_id);
   
   if(!is_trx_visible) {
+    dbug("trx not visible");
     goto fetch_again;
   }
   
@@ -3268,23 +3279,22 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
 }
 
 bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
-  //return true;
   uint64_t history_trx_id = warp_state->get_history_lock(rowid);
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
-
+  
   if(history_trx_id == 0 
     || history_trx_id < current_trx->trx_id 
     || (history_trx_id > current_trx->trx_id && (current_trx->isolation_level != ISO_REPEATABLE_READ && current_trx->isolation_level != ISO_SERIALIZABLE))) {
     // no history lock or may have been commited into delete map
-    // in earlier trx so have to check to see if the row is deleted
+    // in a visible trx so have to check to see if the row is deleted
     if(is_deleted(current_rowid)) {
       return false;
     }
   } else {
     return false;
   }
-
+  
   return true;
 }
 
