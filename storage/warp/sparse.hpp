@@ -23,17 +23,18 @@
 #include <sys/file.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-
+#include <assert.h>
 #define MODE_SET 1
 #define MODE_UNSET 0
 // 64 bits
 #define BLOCK_SIZE 8
 #define MAX_BITS 64
+bool bitmap_debug = false;
 
 //#ifdef WARP_BITMAP_DEBUG
-#define bitmap_dbug(x) std::cerr << __LINE__ << ": " << x << "\n"; 
+//#define bitmap_dbug(x) if(bitmap_debug) std::cerr << __LINE__ << ": " << x << "\n"; 
 //#else
-//#define //bitmap_dbug(x) /* would write (x) to debug log*/
+#define bitmap_dbug(x) /* would write (x) to debug log*/
 //#endif
 
 class sparsebitmap
@@ -55,21 +56,21 @@ private:
 
   /* Index locking */ 
   void unlock() { 
-    //bitmap_dbug("unlock");
+    ////bitmap_dbug("unlock");
     if(have_lock == LOCK_UN) return;
     flock(fileno(fp), LOCK_UN); 
     have_lock = LOCK_UN; 
   }
 
   void lock(int mode) {
-    //bitmap_dbug("lock");
+    ////bitmap_dbug("lock");
     if(have_lock == LOCK_EX || have_lock == mode) return;
     flock(fileno(fp), mode);
     have_lock = mode;
   }
 
   /* bits at current filepointer location */
-  unsigned long long bits; 
+  uint64_t bits; 
 
   /* File pointers for data and log */
   FILE *fp=NULL; 
@@ -87,14 +88,14 @@ private:
 
   /* check for file existance */
   bool exists(std::string filename) {
-    //bitmap_dbug("exists");
+    ////bitmap_dbug("exists");
     struct stat buf;
     return !stat(filename.c_str(), &buf);
   }
 
   /* replay the changes in the log, in either redo(MODE_SET) or undo(MODE_UNSET) */
   int replay (int mode=MODE_UNSET) {
-    //bitmap_dbug("replay");
+    ////bitmap_dbug("replay");
     fseek(log,0,SEEK_SET);
     clearerr(log);
     fpos = 0;
@@ -163,7 +164,7 @@ private:
       dirty=0;
       throw(1); 
     }
-    //bitmap_dbug("STARTING RECOVERY");
+    ////bitmap_dbug("STARTING RECOVERY");
     // start recovery
     int mode=MODE_SET;
     fseek(log,-BLOCK_SIZE,SEEK_END);
@@ -189,7 +190,7 @@ private:
 
 public:
 	sparsebitmap(std::string filename,int lock_mode = LOCK_SH) {
-    //bitmap_dbug("construct");
+    //bitmap_dbug("construct);
     fp = NULL; 
     log = NULL;
     bits = 0;
@@ -200,6 +201,7 @@ public:
   }
 
 	~sparsebitmap() {
+    if(dirty) rollback();
     unlock();
     if(fp){ fsync(fileno(fp)); fclose(fp); }
     if(log) { fsync(fileno(log)); fclose(log); }
@@ -213,7 +215,7 @@ public:
   /* -2 means could not create*/
   /* -3 means could not open*/
   int open(std::string filename, int lock_mode = LOCK_SH) {
-    //bitmap_dbug("open");
+    ////bitmap_dbug("open");
     if(fp != NULL) close();
     bits = 0;
     int skip_recovery = 0;
@@ -261,16 +263,16 @@ public:
         
     fpos = 0;
     dirty = 0;
-    //bitmap_dbug("bits at open: " + std::to_string(bits));
+    ////bitmap_dbug("bits at open: " + std::to_string(bits));
 
     return 0;
   }
 
   /* close the index */
   int close(int unlink_log = 0) {
-    //bitmap_dbug("close");
+    ////bitmap_dbug("close");
     /* this will UNDO all the changes made to the index because commit() was not called*/
-    //bitmap_dbug("dirty flag: " + std::to_string(dirty));
+    ////bitmap_dbug("dirty flag: " + std::to_string(dirty));
     if(!recovering && dirty) do_recovery();
 
     if(fp) fsync(fileno(fp));
@@ -383,37 +385,48 @@ public:
 
   /* check to see if a particular bit is set */
   inline int is_set(unsigned long long bitnum) {
-    
     assert(bitnum > 0);
+    
     //bitmap_dbug("is_set: bit " + std::to_string(bitnum));
     if(!fp) open(fname, LOCK_SH);
     lock(LOCK_SH);
     
     int bit_offset;
-  //  set_bit_mtx.lock();
-    unsigned long long at_byte = (bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1;
+  
+    unsigned long long at_byte = (bitnum / MAX_BITS);
+    bit_offset = (bitnum % MAX_BITS);
+    at_byte = at_byte * sizeof(bits);
+    //bitmap_dbug("at_byte: " << at_byte);
+    //bitmap_dbug("bit_offset: " << bit_offset);
+    //bitmap_dbug("filesize: " << filesize);
+    //bitmap_dbug("fpos: " << fpos);
+    //bitmap_dbug("bits:" << bits);
+
     if(at_byte > filesize) {
+      //bitmap_dbug("at_byte > filesize, bits=0, fpos=at_byte");
       fpos = at_byte;
       bits = 0;
       return 0;
     }
 
     if(at_byte != fpos) {
-      
-      fseek(fp, at_byte, SEEK_SET);
+      int rval = fseek(fp, at_byte, SEEK_SET);
       fpos = at_byte;
-      size_t sz = fread(&bits, BLOCK_SIZE, 1, fp);
-      fseek(fp, at_byte, SEEK_SET); 
+      //bitmap_dbug("at pos: " << fpos);
+      //bitmap_dbug("reading bits");
+      bits = 0;
+      //bitmap_dbug("bits:" << bits);      
+      size_t sz = fread(&bits, sizeof(bits), 1, fp);
       if(sz == 0) { 
+        //bitmap_dbug("sz=0, return 0");
         bits = 0;
- //       set_bit_mtx.unlock();
         return 0;
       }
-    
     }
-//    set_bit_mtx.unlock();
+    //bitmap_dbug("bits:" << bits);
+    //bitmap_dbug("test:" << ((bits >> bit_offset) & 1));    
     int retval = (bits >> bit_offset) & 1; 
-    
+    //bitmap_dbug("retval:" << retval);
     return retval ;
   }
 
@@ -422,8 +435,9 @@ public:
   /* -1 = logging failure (no change to index) */
   /* -2 = index read/write failure  */
   inline int set_bit(unsigned long long bitnum, int mode = MODE_SET) {
-    //bitmap_dbug("set_bit");
+    ////bitmap_dbug("set_bit");
     assert(bitnum > 0);
+   
     if (fp) clearerr(fp);
     //set_bit_mtx.lock();
  
@@ -449,34 +463,48 @@ public:
     int bit_offset;
 
     /* where to read at in file */
-    unsigned long long at_byte = (bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1;
+    //bitmap_dbug("bitnum: " << bitnum);
+    unsigned long long at_byte = (bitnum / MAX_BITS);
+    bit_offset = (bitnum % MAX_BITS);
+    at_byte = at_byte * sizeof(bits);
+    //bitmap_dbug("at_byte: " << at_byte);
+    //bitmap_dbug("bit_offset: " << bit_offset);
+    //bitmap_dbug("filesize: " << filesize);
+    //bitmap_dbug("fpos: " << fpos);
+    //bitmap_dbug("bits:" << bits);
 
     /* read the bits into memory if necessary */
     if(at_byte != fpos) {
       fpos = at_byte;
       fseek(fp, at_byte, SEEK_SET);
-      sz = fread(&bits, BLOCK_SIZE, 1, fp);
-  
+      //bitmap_dbug("fpos: " << fpos);
+      //bitmap_dbug("reading bits");
+      bits = 0;
+      sz = fread(&bits, sizeof(bits), 1, fp);
+      //bitmap_dbug("after read bits:" << bits);
       if(ferror(fp)) {
         return -2;
       }
       fseek(fp, at_byte, SEEK_SET); 
     }
-  
+    //bitmap_dbug("BIT_OFFSET: " << bit_offset);
+    //bitmap_dbug((1ULL << bit_offset));
     if(mode == MODE_SET)
-      bits |= 1 << bit_offset; 
+      bits |= (1ULL << bit_offset); 
     else
-      bits &= ~(1 << bit_offset);
-  
+      bits &= ~(1ULL << bit_offset);
+    //bitmap_dbug("new bits:" << bits);
+
     if(at_byte != fpos) {
       fseek(fp, at_byte, SEEK_SET);
       fpos = at_byte;
     }
+    //bitmap_dbug("writing bits");
     sz = fwrite(&bits, BLOCK_SIZE, 1, fp);
     /* position back so that we don't read the block in again*/
     fseek(fp, at_byte, SEEK_SET); 
     if(at_byte > filesize) {
-      filesize = at_byte;
+      filesize = at_byte + sizeof(bits);
     }
     //set_bit_mtx.unlock();
     return sz == 1 ? 0 : -2;
@@ -485,7 +513,7 @@ public:
   /*
   // todo: support numbered savepoints
   int create_savepoint(uint64_t savepoint_num) {
-    //bitmap_dbug("create_savepoint");
+    ////bitmap_dbug("create_savepoint");
     if(!fp || have_lock != LOCK_EX) open(fname, LOCK_EX);
     std::string savepoint_fname = std::string("sp_") + fname + std::string("_") + std::to_string(savepoint_num) + std::string(".txlog");
     FILE* splog = fopen(savepoint_fname.c_str, "wb+");
@@ -498,7 +526,7 @@ public:
 
   // todo: support numbered savepoints
   int rollback_to_savepoint(uint64_t savepoint_num) {
-    //bitmap_dbug("rollback_to_savepoint");
+    ////bitmap_dbug("rollback_to_savepoint");
 
     clearerr(log);
     fseek(log, 0, SEEK_SET);
