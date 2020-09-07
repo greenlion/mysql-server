@@ -150,7 +150,7 @@ mysql_declare_plugin(warp){
  
 static int warp_init_func(void *p) {
   DBUG_ENTER("warp_init_func");
-  sql_print_error("WARP storage engine initialization started");
+  sql_print_information("WARP storage engine initialization started");
   handlerton *warp_hton;
   ibis::fileManager::adjustCacheSize(my_cache_size);
   ibis::init(NULL, "/tmp/fastbit.log");
@@ -178,18 +178,18 @@ static int warp_init_func(void *p) {
   warp_state = new warp_global_data();
   
   assert(warp_state != NULL);
-  sql_print_error("WARP storage engine initialization completed");
+  sql_print_information("WARP storage engine initialization completed");
   DBUG_RETURN(0);
 }
 
 static int warp_done_func(void *) {
-  sql_print_error("WARP storage engine shutdown started");
+  sql_print_information("WARP storage engine shutdown started");
   warp_open_tables.reset();
 
   // destroying warp_state writes the state to disk
   delete warp_state;
   mysql_mutex_destroy(&warp_mutex);
-  sql_print_error("WARP storage engine shutdown completed");
+  sql_print_information("WARP storage engine shutdown completed");
   return 0;
 }
 
@@ -1305,6 +1305,7 @@ THR_LOCK_DATA **ha_warp::store_lock(THD *, THR_LOCK_DATA **to,
                                     enum thr_lock_type lock_type) {
   DBUG_ENTER("ha_warp::store_lock");
   //auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  //dbug("STORE_LOCK: " << lock_type);
   lock_in_share_mode = false;
   lock_for_update = false;
 
@@ -1320,7 +1321,7 @@ THR_LOCK_DATA **ha_warp::store_lock(THD *, THR_LOCK_DATA **to,
     lock.type = lock_type;
   }
 
-  *to++ = &lock;
+  //*to++ = &lock;
   DBUG_RETURN(to);
 }
 
@@ -2876,7 +2877,7 @@ int ha_warp::bitmap_merge_join() {
 /* Transaction support functions
    TODO: describe WARP transactions
 */
-int ha_warp::start_stmt(THD *thd, thr_lock_type lock_type) {
+int ha_warp::start_stmt(THD *, thr_lock_type) {
   /*
   fprintf(stderr, "ENTER START_STMT\n");
   int trx_state = 0;
@@ -2905,7 +2906,7 @@ int ha_warp::start_stmt(THD *thd, thr_lock_type lock_type) {
   }
   return retval;
   */
-  return -1;
+  return 0;
 }
 
 int ha_warp::register_trx_with_mysql(THD* thd, warp_trx* trx) {
