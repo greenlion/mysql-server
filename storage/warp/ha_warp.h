@@ -555,6 +555,9 @@ class ha_warp : public handler {
   int open_trx_log();
   int close_trx_log();
 
+  bool lock_in_share_mode = false;
+  bool lock_for_update = false;
+
   //std::string unique_check_where_clause = "";
   //bool table_checked_unique_keys = false;
   //bool table_has_unique_keys = false;

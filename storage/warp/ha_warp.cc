@@ -1304,6 +1304,18 @@ int ha_warp::repair(THD *, HA_CHECK_OPT *) {
 THR_LOCK_DATA **ha_warp::store_lock(THD *, THR_LOCK_DATA **to,
                                     enum thr_lock_type lock_type) {
   DBUG_ENTER("ha_warp::store_lock");
+  //auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  lock_in_share_mode = false;
+  lock_for_update = false;
+
+  if(lock_type == TL_READ_WITH_SHARED_LOCKS) {
+    lock_in_share_mode = true;
+  }
+
+  if(lock_type == TL_WRITE) {
+    lock_for_update = true;
+  }
+
   if(lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
     lock.type = lock_type;
   }
@@ -1711,33 +1723,33 @@ fetch_again:
   // because the delete_rows bitmap has bits possibly committed
   // from future transaction, a history lock is created to 
   // maintain row visiblity
-  
   if(!is_row_visible_to_read(current_rowid)) {
     goto fetch_again;
   }
   
-/*
+  // Lock rows during a read if requested
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
   int lock_taken = 0;
-  if(current_trx->lock_in_share_mode) {
+  if(lock_in_share_mode) {
     lock_taken = warp_state->create_lock(current_rowid, current_trx, LOCK_SH);
     // row is exclusive locked so it has been deleted but this row should 
     // have already been skipped because it has a history lock
     if(lock_taken == LOCK_EX) {
       goto fetch_again;
     }
+  
     if(lock_taken != LOCK_SH && lock_taken != WRITE_INTENTION) {
-      // some sort of error happened like DEADLOCK or LOCK_WAIT_TIMEOUt
+        // some sort of error happened like DEADLOCK or LOCK_WAIT_TIMEOUt
       DBUG_RETURN(lock_taken);
     }
   } else {
-    if(current_trx->for_update) {
+    if(lock_for_update) {
       lock_taken = warp_state->create_lock(current_rowid, current_trx, WRITE_INTENTION);
-      if(lock_taken != LOCK_EX) {
-       DBUG_RETURN(lock_taken);
+      if(lock_taken != WRITE_INTENTION) {
+        DBUG_RETURN(lock_taken);
       }
     }  
   }
-  */
   
   find_current_row(buf, cursor);
 
@@ -2907,7 +2919,7 @@ int ha_warp::register_trx_with_mysql(THD* thd, warp_trx* trx) {
 }
 
 int ha_warp::external_lock(THD *thd, int lock_type){ 
-
+    
   if (lock_type != F_UNLCK)  {
     auto current_trx = warp_get_trx(warp_hton, table->in_use);
     if(current_trx == NULL) current_trx = create_trx(table->in_use);
@@ -2925,17 +2937,18 @@ int ha_warp::external_lock(THD *thd, int lock_type){
     /* serializable isolation level takes shared locks on all visible rows traveresed
       and so does LOCK IN SHARE MODE
     */
-    current_trx->lock_in_share_mode = false;
-    if (lock_type == F_RDLCK || current_trx->isolation_level == ISO_SERIALIZABLE) {
+    if (current_trx->isolation_level == ISO_SERIALIZABLE) {
       current_trx->lock_in_share_mode=true;
     }
+
     enum_sql_command sql_command = (enum_sql_command)thd_sql_command(thd);
     if(sql_command == SQLCOM_UPDATE || 
       sql_command == SQLCOM_INSERT ||
       sql_command == SQLCOM_REPLACE ||
       sql_command == SQLCOM_DELETE ||
       sql_command == SQLCOM_INSERT_SELECT ||
-      sql_command == SQLCOM_LOAD)  {  // the first time a data modification statement is encountered
+      sql_command == SQLCOM_LOAD)  {  
+      // the first time a data modification statement is encountered
       // the transaction is marked dirty.  Registering the open
       // transaction prevents a transaction from seeing inserts
       // that are not visible to it and to still find duplicate
@@ -3294,32 +3307,32 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
     statement are rolled back.
 */
 int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
-  warp_trx* trx = warp_get_trx(hton, thd);
+  warp_trx* current_trx = warp_get_trx(hton, thd);
   //if a statement failed, we need to rollback the insertions
   //
   if(rollback_trx) {
-    if(trx->dirty) {
+    if(current_trx->dirty) {
       // undo the changes
-      trx->rollback(true);  
+     current_trx->rollback(true);  
       // remove the transaction from the open list
       //warp_state->mark_transaction_closed(trx->trx_id);
     }
   } else {
     //statement rollback
-    if(trx->dirty) {  
-        trx->rollback(ROLLBACK_STATEMENT);
+    if(current_trx->dirty) {  
+        current_trx->rollback(ROLLBACK_STATEMENT);
     }
-    if(trx->autocommit) {
+    if(current_trx->autocommit) {
       //warp_state->mark_transaction_closed(trx->trx_id);
-      trx->dirty = false;
+      current_trx->dirty = false;
     } else {
       return 0;
     }
   }
   // destroy the transaction
-  warp_state->free_locks(trx);
+  warp_state->free_locks(current_trx);
   warp_state->cleanup_history_locks();
-  delete trx;
+  delete current_trx;
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
   return 0;
 }
@@ -3718,9 +3731,14 @@ retry_lock:
 
       // the current transaction already holds a lock on this row
       if(test_lock.holder != trx->trx_id) {
-        if(test_lock.lock_type == LOCK_EX || test_lock.lock_type == WRITE_INTENTION) {
+        //dbug("test_lock.holder: " << test_lock.holder << " requestor: " << trx->trx_id);
+        //dbug("test_lock.lock_type: " << test_lock.lock_type << " requesting lock: " << lock_type)
+        // go ahead and give out a share lock if there is already a share lock
+        if(test_lock.lock_type != LOCK_HISTORY && (test_lock.lock_type != LOCK_SH && lock_type != LOCK_SH)) {
+          lock_mtx.unlock();
           goto sleep;
         }
+
       } else {
         if(test_lock.waiting_on != 0) {
           // does the waiting transaction still exist?
@@ -3734,7 +3752,7 @@ retry_lock:
           lock_mtx.unlock();
           return lock_type;
         }
-
+       
         if(test_lock.lock_type == WRITE_INTENTION && lock_type == LOCK_EX && test_lock.holder == trx->trx_id) {
           // upgrade intention lock to EX_LOCK
           row_locks.erase(it2);
@@ -3744,20 +3762,27 @@ retry_lock:
         } else {
           // if LOCK_SH is requested and LOCK_EX has been granted return the EX_LOCK
           // this should generally never happen unless an update produced a unique
-          // key violation and the row is being updated again
-          if(test_lock.lock_type >= lock_type) {
+          // key violation and the row is being updated again.  If LOCK_SH is requested
+          // and trx already had LOCK_SH then the existing lock is reused
+          if(test_lock.lock_type >= lock_type && lock_type >= 0) {
             // this transaction already has a strong enough lock on this row
             // no need to insert the new lock and just return the lock 
             lock_mtx.unlock();
             return lock_type; 
           } 
-        }
 
+          if(test_lock.lock_type == LOCK_SH && (lock_type == WRITE_INTENTION || lock_type == LOCK_EX)) {
+            it2->second.lock_type = lock_type;
+            lock_mtx.unlock();
+            return lock_type;
+          }
+        }
+        
         row_locks.erase(it);
         it2 = it;
         continue;
       }
-
+      
       // this lock is a shared lock by somebody else
       // and this lock request is for a shared lock
       // so keep searching - we will grant the lock request
@@ -3782,7 +3807,7 @@ retry_lock:
         lock_mtx.unlock();
         goto sleep;
       }
-
+      
       // If new_lock points to an existing lock and the 
       // other transaction is already waiting on this
       // lock, then a DEADLOCK is detected!
@@ -3792,6 +3817,10 @@ retry_lock:
         row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
         lock_mtx.unlock();
         return LOCK_DEADLOCK;
+      } else {
+        // have to wait to upgrade the lock
+        lock_mtx.unlock();
+        goto sleep;
       }
     }
   }  
@@ -3804,7 +3833,7 @@ retry_lock:
   return lock_type;
 
 sleep:
-  lock_mtx.unlock();
+  //lock_mtx.unlock();
   //fixme - make this configurable
   if(spin_count++ > 0) {
     
@@ -4004,10 +4033,14 @@ int warp_global_data::downgrade_to_history_lock(uint64_t rowid, warp_trx* trx) {
 
 int warp_global_data::free_locks(warp_trx* trx) {
   lock_mtx.lock();
+  restart:
   for(auto it = row_locks.begin(); it != row_locks.end();++it) {
     if(it->second.holder == trx->trx_id) {
       row_locks.erase(it);
-      break;
+      // deleting the lock invalidates the iterator...
+      // so restart at the beginning.   There is probably
+      // a better way to do this...
+      goto restart;
     }
   }
   lock_mtx.unlock();
