@@ -312,6 +312,11 @@ const char rollback_marker  = 5;
 const char savepoint_marker = 6;
 #define ROLLBACK_STATEMENT 0
 
+/* each trx in the commit_list has one of these states */
+#define WARP_UNCOMMITTED_TRX 0
+#define WARP_COMMITTED_TRX   1
+#define WARP_ROLLED_BACK_TRX 2
+
 std::mutex trx_mutex;  
 //Holds the state of a WARP transaction.  Instantiated in ::external_lock
 //or ::start_stmt
@@ -410,16 +415,6 @@ class warp_global_data {
   // between database restarts.
   uint64_t next_rowid = 1;
 
-  // in order to detect unique keys during insertions or updates
-  // it is necessary to distinguish between a transaction that
-  // was rolled back and thus is missing from the commit bitmap
-  // because of rollback or crash, or a transaction that is 
-  // currently open for write.  In the first case, the unique
-  // check must ignore the row, but in the second case the 
-  // unique check must fail, otherwise duplicate values could
-  // end up in a column with a unique or primary key
-  std::forward_list<uint64_t> open_write_trx;
-
   /* this is used to read/write on disk state */
   struct on_disk_state {
     public:
@@ -455,11 +450,13 @@ class warp_global_data {
 
   void write_clean_shutdown();
 
+  
+
   public:
   //sparsebitmap* commit_bitmap = NULL;
   sparsebitmap* delete_bitmap = NULL;
   
-  std::unordered_map<uint64_t, bool> commit_list;
+  std::unordered_map<uint64_t, int> commit_list;
   FILE* commit_file;
   
   // opens and reads the state file.  
@@ -486,6 +483,7 @@ class warp_global_data {
   int downgrade_to_history_lock(uint64_t rowid, warp_trx* trx);
   int free_locks(warp_trx* trx);
   uint64_t get_history_lock(uint64_t rowid);
+  void cleanup_history_locks();
 
 };
 

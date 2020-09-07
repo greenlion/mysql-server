@@ -1609,7 +1609,6 @@ int ha_warp::rnd_init(bool) {
     base_table = NULL;
     partitions = new ibis::partList;
     ibis::util::gatherParts(*partitions, share->data_dir_name, true);
-    //dbug("Found partitions: " << cnt);
     part_it = partitions->begin() + 1;
   }
 
@@ -1704,7 +1703,6 @@ fetch_again:
   is_trx_visible_to_read(row_trx_id);
   
   if(!is_trx_visible) {
-    dbug("trx not visible");
     goto fetch_again;
   }
   
@@ -3017,6 +3015,56 @@ int warp_trx::begin() {
   return retval;
 }
 
+// This causes some visibility problems - leave commented for now
+// revisit in BETA 3.
+void warp_global_data::cleanup_history_locks() {
+/*  
+  commit_mtx.lock();
+  history_lock_mtx.lock();
+
+  uint64_t oldest_open_trx_id = 0;
+  auto trx_it = commit_list.begin();
+  while(trx_it != commit_list.end()) {
+    dbug("trx_id: " << trx_it->first << ", state: " << trx_it->second);
+    if(trx_it->second == WARP_UNCOMMITTED_TRX) {
+      if(oldest_open_trx_id < trx_it->first) {
+        oldest_open_trx_id = trx_it->first;
+      }
+    }
+    ++trx_it;
+  }
+  dbug("Oldest open trx: " << oldest_open_trx_id);
+     
+  if(!oldest_open_trx_id) {
+    history_lock_mtx.unlock();
+    commit_mtx.unlock();
+    return;
+  };
+
+  
+  
+  auto history_lock_it = history_locks.begin();
+  while(history_lock_it != history_locks.end()) {
+    if(history_lock_it->second < oldest_open_trx_id) {
+      dbug("Removing HISTORY lock on trx: " << oldest_open_trx_id << " for rowid: " << history_lock_it->first);
+      history_locks.erase(history_lock_it);
+    }
+    ++history_lock_it;
+  }
+  
+  // remove the rolled back trx from the commit list
+  trx_it = commit_list.begin();
+  while(trx_it != commit_list.end()) {
+    if(trx_it->first < oldest_open_trx_id && trx_it->second == WARP_ROLLED_BACK_TRX) {
+      commit_list.erase(trx_it);
+    }
+  }
+
+  history_lock_mtx.unlock();
+  commit_mtx.unlock();
+*/  
+}
+
 // used when a transaction commits
 // not called when statements commit
 void warp_trx::commit() {
@@ -3067,9 +3115,8 @@ void warp_trx::commit() {
             sql_print_error("transaction log read failed");
             assert(false);
           }
+          
           warp_state->delete_bitmap->set_bit(rowid);
-          // delete and update take history locks automatically now
-          //warp_state->downgrade_to_history_lock(rowid, this);
           continue;
           break;
 
@@ -3094,7 +3141,7 @@ void warp_trx::commit() {
     }
     fsync(fileno(warp_state->commit_file));
 
-    commit_it->second = true;
+    commit_it->second = WARP_COMMITTED_TRX;
     
     fclose(log);
     unlink(log_filename.c_str());
@@ -3188,7 +3235,7 @@ void warp_trx::rollback(bool all) {
   } else {
     /* TRX rollback removes the trx from the commit list */
 
-    warp_state->commit_list.erase(commit_it);
+    commit_it->second = WARP_ROLLED_BACK_TRX;
     fclose(log);
     log = NULL;
     unlink(log_filename.c_str());
@@ -3217,12 +3264,10 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
   //dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx));
   if(commit_trx || current_trx->autocommit) {
     if(current_trx->dirty) {
-       //dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " calling commit!");
-       current_trx->commit();
-       // warp_state->mark_transaction_closed(current_trx->trx_id);
+      current_trx->commit();
     }
   } else {
-      /* this transaction is not ready to be committed to the
+    /* this transaction is not ready to be committed to the
        storage engine because it is part of a multi-statement
        transaction
     */
@@ -3233,9 +3278,9 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
      commited to disk, then the transaction information for
      the connection must be destroyed.
   */
-  //dbug("commit: trx_id=" + std::to_string(current_trx->trx_id) + " commit_trx=" + std::to_string(commit_trx) + " destroy trx.");
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
   warp_state->free_locks(current_trx);
+  warp_state->cleanup_history_locks();
   delete current_trx;
   return 0;
 }
@@ -3273,6 +3318,7 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
   }
   // destroy the transaction
   warp_state->free_locks(trx);
+  warp_state->cleanup_history_locks();
   delete trx;
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
   return 0;
@@ -3282,7 +3328,7 @@ bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
   uint64_t history_trx_id = warp_state->get_history_lock(rowid);
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
-  
+  //dbug("current_trx_id: " << current_trx->trx_id << " history_trx_id: " << history_trx_id << " for rowid: " << rowid);
   if(history_trx_id == 0 
     || history_trx_id < current_trx->trx_id 
     || (history_trx_id > current_trx->trx_id && (current_trx->isolation_level != ISO_REPEATABLE_READ && current_trx->isolation_level != ISO_SERIALIZABLE))) {
@@ -3292,9 +3338,12 @@ bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
       return false;
     }
   } else {
+    /* another transaction has deleted or updated this row */
+    if(history_trx_id != current_trx->trx_id) {
+      return true;
+    }
     return false;
   }
-  
   return true;
 }
 
@@ -3310,6 +3359,8 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
   assert(current_trx != NULL);
   auto commit_it = warp_state->commit_list.find(row_trx_id);
   
+  //dbug("trx_id:" << current_trx->trx_id << " row_trx_id: " << row_trx_id);
+
   /* row belongs to current trx so it is visible */
   if(current_trx->trx_id == row_trx_id) {
     is_trx_visible = true;
@@ -3318,6 +3369,11 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
   
   /* not on the commit list so it was rolled back or not recovered */
   if(commit_it == warp_state->commit_list.end()) {
+    is_trx_visible = false;
+    return is_trx_visible;
+  }
+
+  if(commit_it->second == WARP_ROLLED_BACK_TRX) {
     is_trx_visible = false;
     return is_trx_visible;
   }
@@ -3495,13 +3551,10 @@ warp_global_data::warp_global_data() {
   uint64_t trx_id;
 
   /* load list of committed transactions to the commit list */
-  //dbug("reading committed transactions");
   while( (sz = fread(&trx_id, sizeof(trx_id), 1, commit_file)) == 1) {
-    //dbug("added trx to commit list: " << trx_id);
     commit_list.emplace(std::pair<uint64_t, bool>(trx_id, true));
   }
-  //dbug("committed trx read completed");
-
+  
   // this will create the commits.warp bitmap if it does not exist
   try {
     delete_bitmap = new sparsebitmap(delete_bitmap_file, LOCK_SH); 
@@ -3581,15 +3634,15 @@ uint64_t warp_global_data::get_next_rowid_batch() {
    called in ::external_lock when a transaction first makes changes
 */
 void warp_global_data::register_open_trx(uint64_t trx_id) {
-  //dbug("registering open transaction: " << trx_id );
   commit_mtx.lock();
-  commit_list.emplace(std::pair<uint64_t, bool>(trx_id, false));
+  commit_list.emplace(std::pair<uint64_t, int>(trx_id, WARP_UNCOMMITTED_TRX));
   commit_mtx.unlock();
 }
 
-/* if trx not on commit list it is either rolled back or has not made any changes yet
-   if trx is on commit list and is false then the transaction is open for writes
-   if it is true then the transaction is committed 
+/* if trx not on commit list it is could be either rolled back or has not made any changes yet
+   if trx is on commit list and is WARP_UNCOMMITTED_TRX then the transaction is open for writes
+   if it is any other value then the transaction is not open anymore and has committed or
+   rolled back - it will be removed when the history locks are cleaned up...
 */
 bool warp_global_data::is_transaction_open(uint64_t trx_id) {
   bool retval = false;
@@ -3598,8 +3651,7 @@ bool warp_global_data::is_transaction_open(uint64_t trx_id) {
   if(commit_it == commit_list.end()) {
     retval = false;
   } else {
-
-    retval = (commit_it->second == false);
+    retval = (commit_it->second == WARP_UNCOMMITTED_TRX);
   }
   commit_mtx.unlock();
   return retval;
@@ -3613,14 +3665,14 @@ int warp_global_data::create_lock(uint64_t rowid, warp_trx* trx, int lock_type) 
   sleep_time.tv_nsec = 100000000L; // sleep a millisecond
   // each sleep beyond the spin locks increments the 
   // waiting time
-  ulonglong max_wait_time = THDVAR(current_thd, lock_wait_timeout);
+  ulonglong max_wait_time = THDVAR(current_thd, lock_wait_timeout) * 100000000L;
   ulonglong wait_time = 0;
   // create a new lock for our lock
   // will be deleted and replaced if 
   // we discover we already have this 
   // lock!  
   warp_lock new_lock;
-
+    
   // history locks are taken after EX_LOCKS are granted
   // for more information about history locks, see 
   // ha_warp::update_row comments
@@ -3665,7 +3717,11 @@ retry_lock:
       }
 
       // the current transaction already holds a lock on this row
-      if(test_lock.holder == trx->trx_id) {
+      if(test_lock.holder != trx->trx_id) {
+        if(test_lock.lock_type == LOCK_EX || test_lock.lock_type == WRITE_INTENTION) {
+          goto sleep;
+        }
+      } else {
         if(test_lock.waiting_on != 0) {
           // does the waiting transaction still exist?
           if(is_transaction_open(test_lock.waiting_on)) {
@@ -3678,6 +3734,7 @@ retry_lock:
           lock_mtx.unlock();
           return lock_type;
         }
+
         if(test_lock.lock_type == WRITE_INTENTION && lock_type == LOCK_EX && test_lock.holder == trx->trx_id) {
           // upgrade intention lock to EX_LOCK
           row_locks.erase(it2);
@@ -3695,11 +3752,12 @@ retry_lock:
             return lock_type; 
           } 
         }
+
         row_locks.erase(it);
         it2 = it;
         continue;
       }
-      
+
       // this lock is a shared lock by somebody else
       // and this lock request is for a shared lock
       // so keep searching - we will grant the lock request
@@ -3724,7 +3782,7 @@ retry_lock:
         lock_mtx.unlock();
         goto sleep;
       }
-      
+
       // If new_lock points to an existing lock and the 
       // other transaction is already waiting on this
       // lock, then a DEADLOCK is detected!
@@ -3737,7 +3795,7 @@ retry_lock:
       }
     }
   }  
-  
+
   new_lock.waiting_on = 0;
   // insert the new lock
   row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
@@ -3746,6 +3804,7 @@ retry_lock:
   return lock_type;
 
 sleep:
+  lock_mtx.unlock();
   //fixme - make this configurable
   if(spin_count++ > 0) {
     
@@ -3762,6 +3821,7 @@ sleep:
   if(wait_time >= max_wait_time) {
     return ER_LOCK_WAIT_TIMEOUT;
   }
+
   // lock sleep completed 
   goto retry_lock;
 

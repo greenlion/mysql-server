@@ -410,7 +410,7 @@ public:
     }
 
     if(at_byte != fpos) {
-      int rval = fseek(fp, at_byte, SEEK_SET);
+      fseek(fp, at_byte, SEEK_SET);
       fpos = at_byte;
       //bitmap_dbug("at pos: " << fpos);
       //bitmap_dbug("reading bits");
